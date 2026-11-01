@@ -1,0 +1,95 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jobline · collected jobs</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Instrument+Sans:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'jobs/css/app.css' %}">
+</head>
+<body>
+  <header class="top">
+    <a class="wordmark" href="#/jobs">Jobline</a>
+    <nav class="nav" aria-label="Main">
+      <a href="#/jobs" data-route="jobs">Jobs</a>
+      <a href="#/runs" data-route="runs">Fetch runs</a>
+      <a href="#/sources" data-route="sources">Sources</a>
+    </nav>
+    <div class="spacer"></div>
+    <button id="fetch-btn" class="btn signal" type="button" hidden>Fetch jobs now</button>
+    <div class="who">
+      <span class="name" id="who-name"></span>
+      <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="linklike" type="submit">Sign out</button></form>
+    </div>
+  </header>
+
+  <section class="status" aria-label="Collection status">
+    <div class="status-head">
+      <div>
+        <h1 id="headline">Loading…</h1>
+        <p class="sub" id="subline"></p>
+      </div>
+    </div>
+    <div id="run-progress" hidden></div>
+    <div>
+      <div class="grid51" id="grid" aria-label="Health of each source"></div>
+      <div class="legend" id="legend" style="margin-top:.6rem">
+        <span><i class="ok"></i>Collecting</span>
+        <span><i class="failed"></i>Last fetch failed</span>
+        <span><i class="skipped"></i>Needs an adapter</span>
+        <span><i></i>Not fetched yet</span>
+      </div>
+    </div>
+  </section>
+
+  <main id="view" aria-live="polite"></main>
+
+  <div id="drawer-root"></div>
+  <div id="toasts" role="status"></div>
+
+  <dialog id="confirm-dialog">
+    <h2>Fetch jobs now?</h2>
+    <p id="confirm-text"></p>
+    <div class="actions">
+      <button class="btn" type="button" id="confirm-cancel">Cancel</button>
+      <button class="btn signal" type="button" id="confirm-ok">Fetch jobs</button>
+    </div>
+  </dialog>
+
+  <dialog id="add-dialog">
+    <form method="dialog" id="add-form">
+      <h2>Add a company</h2>
+      <p style="margin:0;color:var(--muted)">Paste the company's Greenhouse or Lever job board link. We check it first, then fetch its jobs.</p>
+      <label class="field"><span>Company name</span><input type="text" id="add-name" required maxlength="120" autocomplete="off"></label>
+      <label class="field"><span>Job board link</span>
+        <input type="text" id="add-link" required placeholder="https://jobs.lever.co/company or https://boards.greenhouse.io/company" autocomplete="off" spellcheck="false"></label>
+      <div id="add-result" class="test-result" hidden></div>
+      <div class="actions">
+        <button class="btn" type="button" id="add-cancel">Cancel</button>
+        <button class="btn primary" type="submit" id="add-save">Add and fetch</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="source-dialog">
+    <form method="dialog" id="source-form">
+      <h2 id="source-title">Edit source</h2>
+      <label class="field"><span>Adapter</span><select id="src-adapter"></select></label>
+      <label class="field" id="src-board-field"><span id="src-board-label">Board token</span>
+        <input type="text" id="src-board" autocomplete="off" spellcheck="false"></label>
+      <label class="field" id="src-region-field"><span>Lever region</span>
+        <select id="src-region"><option value="global">Global (api.lever.co)</option><option value="eu">EU (api.eu.lever.co)</option></select></label>
+      <div id="src-test" class="test-result" hidden></div>
+      <div class="actions">
+        <button class="btn" type="button" id="src-test-btn">Test connection</button>
+        <button class="btn" type="button" id="src-cancel">Cancel</button>
+        <button class="btn primary" type="submit" id="src-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="{% static 'jobs/js/app.js' %}"></script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Jobline</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Instrument+Sans:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'jobs/css/app.css' %}">
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login-card panel" method="post">
+      {% csrf_token %}
+      <div>
+        <h1>Jobline</h1>
+        <p>Sign in to see the jobs collected from company career pages.</p>
+      </div>
+      {% if form.errors %}<div class="error" role="alert">Username or password is incorrect.</div>{% endif %}
+      <label class="field"><span>Username</span>
+        <input type="text" name="username" autocomplete="username" autofocus required></label>
+      <label class="field"><span>Password</span>
+        <input type="password" name="password" autocomplete="current-password" required
+               style="width:100%;padding:.5rem .65rem;border:1px solid var(--line);border-radius:4px"></label>
+      <input type="hidden" name="next" value="{{ next }}">
+      <button class="btn primary" type="submit" style="justify-content:center">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>
