@@ -23,20 +23,63 @@ class RunInProgress(Exception):
         self.run = run
 
 
+# Fields a running fetch may write while it works. It never writes active_marker (except clearing it at the end)
+# or cancel_requested, so a run released or stopped from the dashboard cannot be "revived" by a late save.
+PROGRESS_FIELDS = ["total_sources", "successful_sources", "failed_sources", "skipped_sources",
+                   "jobs_discovered", "jobs_created", "jobs_updated", "heartbeat_at"]
+
+DEAD_RUN_MESSAGE = ("This fetch stopped responding, most likely because the server was stopped or restarted while it "
+                    "was running. Jobs collected before that point were kept. Start a new fetch to finish the rest.")
+
+
 # ------------------------------------------------------------------ creation / locking
-def _release_stale_runs():
+def _finish_released(run_ids, status, message):
+    now = timezone.now()
+    FetchRun.objects.filter(pk__in=run_ids).update(
+        status=status, active_marker=None, completed_at=now, current_step="", error_summary=message)
+    SourceRunResult.objects.filter(fetch_run_id__in=run_ids, status=SourceRunResult.STATUS_RUNNING).update(
+        status=SourceRunResult.STATUS_FAILED, completed_at=now, error_message="Interrupted before this company finished.")
+
+
+def release_stale_runs():
+    """Release runs with no heartbeat for STALE_RUN_MINUTES. Called whenever run status is read or a run is
+    created, so a run whose process died never blocks the dashboard."""
     cutoff = timezone.now() - timedelta(minutes=settings.STALE_RUN_MINUTES)
-    FetchRun.objects.filter(active_marker=True, heartbeat_at__lt=cutoff).update(
-        status=FetchRun.STATUS_FAILED,
-        active_marker=None,
-        completed_at=timezone.now(),
-        error_summary="Run stopped responding (worker restarted or crashed) and was released.",
-    )
+    ids = list(FetchRun.objects.filter(active_marker=True, heartbeat_at__lt=cutoff).values_list("pk", flat=True))
+    if ids:
+        log.warning("Releasing stale run(s) %s (no heartbeat for %s minutes)", ids, settings.STALE_RUN_MINUTES)
+        _finish_released(ids, FetchRun.STATUS_FAILED, DEAD_RUN_MESSAGE)
+    return ids
+
+
+_release_stale_runs = release_stale_runs  # old name, kept for compatibility
+
+
+def _runs_in_this_process():
+    return {t.name for t in threading.enumerate() if t.name.startswith("fetch-run-") and t.is_alive()}
+
+
+def cancel_run(run, user=None):
+    """Stop a run. Returns "stopped" (released now) or "stopping" (a live run stops before its next company)."""
+    who = f" by {user.get_username()}" if getattr(user, "is_authenticated", False) else ""
+    FetchRun.objects.filter(pk=run.pk).update(cancel_requested=True)
+    run.refresh_from_db()
+    if not run.is_active:
+        return "stopped"
+    # Started from the dashboard in thread mode, its thread lives in this web process. If that thread is gone
+    # (server restarted), nothing is running it: release it now instead of waiting for the stale timeout.
+    dashboard_thread_gone = (settings.RUN_MODE == "thread" and run.triggered_by_id is not None
+                             and f"fetch-run-{run.pk}" not in _runs_in_this_process())
+    if run.status == FetchRun.STATUS_QUEUED or dashboard_thread_gone:
+        _finish_released([run.pk], FetchRun.STATUS_CANCELLED,
+                         f"Stopped{who}. Jobs collected before that point were kept.")
+        return "stopped"
+    return "stopping"
 
 
 def create_run(trigger, user=None, source_ids=None):
     """Create a queued run, or raise RunInProgress. The unique active_marker is the guard."""
-    _release_stale_runs()
+    release_stale_runs()
     try:
         with transaction.atomic():
             return FetchRun.objects.create(
@@ -70,6 +113,14 @@ def _progress(run, step, **fields):
     run.save(update_fields=["current_step", "heartbeat_at", *fields.keys()])
 
 
+class _Cancelled(Exception):
+    pass
+
+
+def _cancel_requested(run):
+    return FetchRun.objects.filter(pk=run.pk, cancel_requested=True).exists()
+
+
 # ------------------------------------------------------------------ execution
 def execute_run(run_id):
     """Execute a queued run. Safe to call from a thread, the worker, or the CLI."""
@@ -86,7 +137,9 @@ def execute_run(run_id):
         run.completed_at = timezone.now()
         run.current_step = ""
         run.active_marker = None
-        run.save()
+        run.heartbeat_at = timezone.now()
+        run.save(update_fields=[*PROGRESS_FIELDS, "status", "error_summary", "completed_at", "current_step",
+                                "active_marker"])
     log.info("Run %s finished: %s | created=%s updated=%s", run.pk, run.status, run.jobs_created, run.jobs_updated)
     return run
 
@@ -101,6 +154,13 @@ def _execute(run):
 
     errors = []
     for index, source in enumerate(sources, start=1):
+        if _cancel_requested(run):
+            done = run.successful_sources + run.failed_sources + run.skipped_sources
+            run.status = FetchRun.STATUS_CANCELLED
+            errors.insert(0, f"Stopped from the dashboard after {done} of {run.total_sources} sources. "
+                             "Jobs collected before that point were kept.")
+            run.error_summary = "\n".join(errors)[:4000]
+            return
         _progress(run, f"Collecting {source.company_name} ({index}/{len(sources)})")
         _collect_source(run, source, errors)
         if index < len(sources) and settings.SOURCE_DELAY_SECONDS > 0:
@@ -138,7 +198,7 @@ def _collect_source(run, source, errors):
             result.status = SourceRunResult.STATUS_SUCCESS
             result.discovered_count, result.created_count = stats.discovered, stats.created
             result.updated_count, result.skipped_count = stats.updated, stats.skipped
-            result.filtered_count = stats.filtered
+            result.filtered_count, result.trimmed_count = stats.filtered, stats.trimmed
             result.closed_count, result.warnings = stats.closed, stats.warning
             source.last_status, source.last_error = Source.STATUS_SUCCESS, ""
             source.last_success_at, source.consecutive_failures = timezone.now(), 0
@@ -155,11 +215,12 @@ def _collect_source(run, source, errors):
         result.completed_at = timezone.now()
         result.save()
         source.save()
-        run.save()
+        run.heartbeat_at = timezone.now()
+        run.save(update_fields=PROGRESS_FIELDS)
     log.info(
-        "run=%s source=%s(%s) status=%s found=%s india_kept=%s new=%s updated=%s",
+        "run=%s source=%s(%s) status=%s found=%s outside_country=%s over_cap=%s new=%s updated=%s",
         run.pk, source.pk, source.company_name, result.status, result.discovered_count,
-        result.discovered_count - result.filtered_count, result.created_count, result.updated_count,
+        result.filtered_count, result.trimmed_count, result.created_count, result.updated_count,
     )
 
 

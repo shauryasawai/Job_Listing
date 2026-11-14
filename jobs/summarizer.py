@@ -35,6 +35,38 @@ class SummaryResult:
     completion_tokens: int = 0
 
 
+def openai_error(resp):
+    """(code, message) from an OpenAI error response body."""
+    try:
+        err = (resp.json() or {}).get("error") or {}
+    except (ValueError, AttributeError):
+        err = {}
+    if not isinstance(err, dict):
+        err = {"message": str(err)}
+    return str(err.get("code") or err.get("type") or ""), str(err.get("message") or "").strip()
+
+
+_HINTS = {
+    401: "The key is wrong, revoked or incomplete. Copy it again from platform.openai.com/api-keys into OPENAI_API_KEY "
+         "in .env (no quotes, no spaces), then restart the server. Run `python manage.py check_openai` to see which key is loaded.",
+    403: "The key is valid but not allowed to do this: a restricted key without model access, a project that can't use "
+         "this model, or an unsupported region. Check the key's permissions and the project's model access on "
+         "platform.openai.com, or set OPENAI_MODEL to a model your project can use.",
+    404: "The model in OPENAI_MODEL isn't available to this key. Run `python manage.py check_openai` and set a model your account can use.",
+    429: "The OpenAI account has no remaining credit. Add billing or credit at platform.openai.com (Settings → Billing).",
+}
+
+
+def explain_openai_error(resp):
+    code, msg = openai_error(resp)
+    status = resp.status_code
+    head = f"OpenAI refused the request (HTTP {status}{', ' + code if code else ''})"
+    detail = f": {msg[:300]}" if msg else ""
+    hint = _HINTS.get(status if not (status == 400 and code == "model_not_found") else 404, "")
+    log.error("%s%s", head, detail)
+    return f"{head}{detail}. {hint}".strip()
+
+
 def ai_enabled():
     return bool(settings.OPENAI_API_KEY)
 
@@ -89,16 +121,12 @@ def ai_summary(title, company, location, description):
                     prompt_tokens=int(usage.get("prompt_tokens") or 0),
                     completion_tokens=int(usage.get("completion_tokens") or 0),
                 )
-            if resp.status_code in (401, 403):
-                raise SummaryAuthError(f"OpenAI rejected the API key (HTTP {resp.status_code})")
-            if resp.status_code == 404 or resp.status_code == 400:
-                # Typically an unavailable model name or bad request: retrying won't help.
-                msg = ""
-                try:
-                    msg = resp.json().get("error", {}).get("message", "")
-                except ValueError:
-                    pass
-                raise SummaryAuthError(f"OpenAI request rejected (HTTP {resp.status_code}): {msg[:200]}")
+            if resp.status_code != 429 and resp.status_code < 500:
+                raise SummaryAuthError(explain_openai_error(resp))
+            code, msg = openai_error(resp)
+            if resp.status_code == 429 and code == "insufficient_quota":
+                raise SummaryAuthError(explain_openai_error(resp))  # no credit: retrying cannot help
+            log.warning("OpenAI HTTP %s (%s), attempt %d/3: %s", resp.status_code, code or "no code", attempt, msg[:200])
             last = f"HTTP {resp.status_code}"
         if attempt < 3:
             time.sleep(2 ** attempt)

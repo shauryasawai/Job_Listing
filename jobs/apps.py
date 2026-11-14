@@ -1,4 +1,5 @@
 from django.apps import AppConfig
+from django.core import checks
 from django.db.backends.signals import connection_created
 
 
@@ -15,4 +16,25 @@ class JobsConfig(AppConfig):
     name = "jobs"
 
     def ready(self):
+        from django.conf import settings
+
+        from .defaults import apply_defaults
+
+        apply_defaults(settings)  # never crash on an outdated settings.py
         connection_created.connect(_sqlite_pragmas)
+        checks.register(_check_settings_up_to_date)
+
+
+def _check_settings_up_to_date(app_configs, **kwargs):
+    from .defaults import MISSING
+
+    if not MISSING:
+        return []
+    return [
+        checks.Warning(
+            "jobagg/settings.py is older than the jobs app: missing " + ", ".join(MISSING) + ".",
+            hint="Built-in defaults (and your .env values) are being used. Replace jobagg/settings.py with the one "
+                 "from the latest download to silence this warning.",
+            id="jobs.W001",
+        )
+    ]

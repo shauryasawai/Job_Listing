@@ -3,48 +3,36 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Jobline · collected jobs</title>
+  <title>Jobline · Find roles to share</title>
+  {% if brand_logo %}<link rel="icon" href="{{ brand_logo }}">{% endif %}
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Instrument+Sans:wght@400;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{% static 'jobs/css/app.css' %}">
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'jobs/css/app.css' %}?v={{ asset_version }}">
 </head>
 <body>
-  <header class="top">
-    <a class="wordmark" href="#/jobs">Jobline</a>
-    <nav class="nav" aria-label="Main">
-      <a href="#/jobs" data-route="jobs">Jobs</a>
-      <a href="#/runs" data-route="runs">Fetch runs</a>
-      <a href="#/sources" data-route="sources">Sources</a>
-    </nav>
-    <div class="spacer"></div>
-    <button id="fetch-btn" class="btn signal" type="button" hidden>Fetch jobs now</button>
-    <div class="who">
-      <span class="name" id="who-name"></span>
-      <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="linklike" type="submit">Sign out</button></form>
+  <a class="skip-link" href="#view">Skip to content</a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/jobs" aria-label="Jobline home"><span class="brand-mark{% if brand_logo %} has-logo{% endif %}" aria-hidden="true">J{% if brand_logo %}<img src="{{ brand_logo }}" alt="" referrerpolicy="no-referrer" onerror="this.parentNode.classList.remove('has-logo');this.remove()">{% endif %}</span><span class="brand-name">Jobline</span></a>
+      <nav class="nav" aria-label="Main">
+        <a href="#/jobs" data-route="jobs">Jobs</a>
+        <a href="#/runs" data-route="runs">Fetch runs</a>
+        <a href="#/sources" data-route="sources">Sources</a>
+      </nav>
+      <div class="spacer"></div>
+      <button id="fetch-btn" class="btn btn-outline" type="button" hidden>Fetch jobs</button>
+      <div class="user">
+        <span class="avatar" id="who-avatar" aria-hidden="true"></span>
+        <span class="user-text"><span class="user-name" id="who-name"></span><span class="user-role" id="who-role"></span></span>
+        <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="linklike" type="submit">Sign out</button></form>
+      </div>
     </div>
   </header>
 
-  <section class="status" aria-label="Collection status">
-    <div class="status-head">
-      <div>
-        <h1 id="headline">Loading…</h1>
-        <p class="sub" id="subline"></p>
-      </div>
-    </div>
-    <div id="run-progress" hidden></div>
-    <div>
-      <div class="grid51" id="grid" aria-label="Health of each source"></div>
-      <div class="legend" id="legend" style="margin-top:.6rem">
-        <span><i class="ok"></i>Collecting</span>
-        <span><i class="failed"></i>Last fetch failed</span>
-        <span><i class="skipped"></i>Needs an adapter</span>
-        <span><i></i>Not fetched yet</span>
-      </div>
-    </div>
-  </section>
+  <div id="run-progress" class="run-banner" hidden></div>
 
-  <main id="view" aria-live="polite"></main>
+  <main id="view" class="page" aria-live="polite" tabindex="-1"></main>
 
   <div id="drawer-root"></div>
   <div id="toasts" role="status"></div>
@@ -58,13 +46,60 @@
     </div>
   </dialog>
 
+  <div id="select-bar" class="select-bar" hidden></div>
+
+  <dialog id="post-dialog" class="wide">
+    <form method="dialog" onsubmit="return false">
+      <h2 id="post-title">Create post</h2>
+      <div class="post-grid">
+        <div class="post-fields">
+          <div id="post-single-fields">
+            <label class="field"><span>Role</span><input type="text" id="post-role"></label>
+            <label class="field"><span>Experience</span><input type="text" id="post-exp" placeholder="e.g. 3 - 6 years"></label>
+            <label class="field"><span>Location</span><input type="text" id="post-loc" placeholder="e.g. Noida"></label>
+            <label class="field"><span>Qualification</span><input type="text" id="post-qual" placeholder="e.g. Bachelor's degree in Marketing"></label>
+          </div>
+          <label class="field"><span>Describe the company as (optional)</span>
+            <input type="text" id="post-company" placeholder="e.g. Factory Automation Company (Funded Startup)"></label>
+          <label class="field"><span>Resumes to (email)</span><input type="text" id="post-email" placeholder="you@company.com" autocomplete="email"></label>
+          <p id="post-email-hint" class="warn-text" hidden>That doesn’t look like an email address.</p>
+          <label class="check"><input type="checkbox" id="post-link"> Add a link to the original posting</label>
+        </div>
+        <div class="post-preview">
+          <label class="field"><span>Post text (you can edit it; changing a field rebuilds it)</span>
+            <textarea id="post-text" rows="16" spellcheck="true"></textarea></label>
+          <p id="post-warn" class="warn-text" hidden></p>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" type="button" id="post-close">Close</button>
+        <a class="btn" id="post-wa" href="#" target="_blank" rel="noopener noreferrer">Share on WhatsApp</a>
+        <button class="btn" type="button" id="post-linkedin">Copy and open LinkedIn</button>
+        <button class="btn primary" type="button" id="post-copy">Copy text</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="add-dialog">
     <form method="dialog" id="add-form">
-      <h2>Add a company</h2>
-      <p style="margin:0;color:var(--muted)">Paste the company's Greenhouse or Lever job board link. We check it first, then fetch its jobs.</p>
-      <label class="field"><span>Company name</span><input type="text" id="add-name" required maxlength="120" autocomplete="off"></label>
-      <label class="field"><span>Job board link</span>
-        <input type="text" id="add-link" required placeholder="https://jobs.lever.co/company or https://boards.greenhouse.io/company" autocomplete="off" spellcheck="false"></label>
+      <h2>Add a source</h2>
+      <label class="field"><span>Type</span>
+        <select id="add-kind">
+          <option value="company">Company job board (Greenhouse or Lever link)</option>
+          <option value="government">Government notice page or RSS feed (official site)</option>
+        </select></label>
+      <label class="field"><span id="add-name-label">Company name</span><input type="text" id="add-name" required maxlength="120" autocomplete="off"></label>
+      <div id="add-company-fields" class="stack">
+        <p style="margin:0;color:var(--muted)">Paste the company's Greenhouse or Lever job board link. We check it first, then fetch its jobs.</p>
+        <label class="field"><span>Job board link</span>
+          <input type="text" id="add-link" placeholder="https://jobs.lever.co/company or https://boards.greenhouse.io/company" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <div id="add-gov-fields" class="stack" hidden>
+        <p style="margin:0;color:var(--muted)">Paste the official page that lists recruitment notices (for example a “Recruitment” or “Advertisements” page), or the site’s RSS feed. We check it first; only recruitment notices are kept.</p>
+        <label class="field"><span>Notice page or RSS feed</span>
+          <input type="text" id="add-gov-url" placeholder="https://www.upsc.gov.in/recruitment/recruitment-advertisement" autocomplete="off" spellcheck="false"></label>
+        <label class="check"><input type="checkbox" id="add-pdf-only" checked> Only links to PDF / document notices (recommended)</label>
+      </div>
       <div id="add-result" class="test-result" hidden></div>
       <div class="actions">
         <button class="btn" type="button" id="add-cancel">Cancel</button>
@@ -79,6 +114,10 @@
       <label class="field"><span>Adapter</span><select id="src-adapter"></select></label>
       <label class="field" id="src-board-field"><span id="src-board-label">Board token</span>
         <input type="text" id="src-board" autocomplete="off" spellcheck="false"></label>
+      <div id="src-notice-fields" class="stack" hidden>
+        <label class="field"><span>Notice page or RSS feed</span><input type="text" id="src-url" autocomplete="off" spellcheck="false"></label>
+        <label class="check"><input type="checkbox" id="src-pdf-only" checked> Only links to PDF / document notices</label>
+      </div>
       <label class="field" id="src-region-field"><span>Lever region</span>
         <select id="src-region"><option value="global">Global (api.lever.co)</option><option value="eu">EU (api.eu.lever.co)</option></select></label>
       <div id="src-test" class="test-result" hidden></div>
@@ -90,6 +129,6 @@
     </form>
   </dialog>
 
-  <script src="{% static 'jobs/js/app.js' %}"></script>
+  <script src="{% static 'jobs/js/app.js' %}?v={{ asset_version }}"></script>
 </body>
 </html>

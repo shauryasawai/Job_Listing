@@ -4,8 +4,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from .greenhouse import GreenhouseAdapter
 from .lever import LeverAdapter
+from .notice_board import NoticeBoardAdapter
 
-ADAPTERS = {cls.key: cls for cls in (GreenhouseAdapter, LeverAdapter)}
+ADAPTERS = {cls.key: cls for cls in (GreenhouseAdapter, LeverAdapter, NoticeBoardAdapter)}
 
 
 def get_adapter(source):

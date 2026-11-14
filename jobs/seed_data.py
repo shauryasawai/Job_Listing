@@ -109,3 +109,14 @@ EXTRA_SLUGS = {
     "New Relic": ["newrelic"],
     "Pure Storage": ["purestorage"],
 }
+
+
+# Official government recruitment pages. Only UPSC has been checked against the live site; the others are
+# well-known official pages added INACTIVE: use Sources -> Edit -> Test connection, then switch them on.
+# (organisation, notices page or RSS feed, only links to PDFs/documents, active)
+GOVERNMENT_SOURCES = [
+    ("UPSC", "https://www.upsc.gov.in/recruitment/recruitment-advertisement", True, True),
+    ("Reserve Bank of India", "https://opportunities.rbi.org.in/Scripts/Vacancies.aspx", False, False),
+    ("State Bank of India", "https://sbi.co.in/web/careers/current-openings", False, False),
+    ("IBPS", "https://www.ibps.in/", False, False),
+]

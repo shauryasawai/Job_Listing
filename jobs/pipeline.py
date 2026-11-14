@@ -9,8 +9,9 @@ from django.db.models import F
 from django.utils import timezone
 
 from .adapters.text import clean_text
-from .geo import matches_country_filter
-from .models import Job
+from .extract import extract_experience, extract_qualification, role_hash
+from .geo import cities_for, encode_cities, matches_country_filter
+from .models import Job, RoleSummary
 
 _TRACKING = re.compile(r"^(utm_|gh_src|gh_jid_src|lever-source|ref$|source$)", re.I)
 CHUNK = 400
@@ -44,6 +45,11 @@ class NormalisedJob:
     posted_at: object
     source_updated_at: object
     content_hash: str
+    experience_min: object
+    experience_max: object
+    qualification: str
+    cities: str
+    role_hash: str
 
 
 _INTERN = re.compile(r"\b(interns?|internships?|trainees?|apprentices?)\b", re.I)
@@ -80,6 +86,7 @@ def normalise(raw):
         key = f"id:{ext}"
     else:
         key = f"url:{url}"[:600]
+    exp_min, exp_max = extract_experience(f"{title}\n{description}")
     digest = hashlib.sha256(f"{title}\n{location}\n{description}".encode("utf-8")).hexdigest()
     return NormalisedJob(
         dedupe_key=key,
@@ -95,24 +102,21 @@ def normalise(raw):
         posted_at=raw.posted_at,
         source_updated_at=raw.source_updated_at,
         content_hash=digest,
+        experience_min=exp_min,
+        experience_max=exp_max,
+        qualification=extract_qualification(description),
+        cities=encode_cities(cities_for([location, *raw.locations], raw.workplace_type)),
+        role_hash=role_hash(title, description),
     )
 
 
-_WORD = re.compile(r"\w+")
-
-
-def similarity(a, b):
-    """Jaccard similarity of word sets: fast and good enough to detect material rewrites."""
-    wa, wb = set(_WORD.findall(a.lower())), set(_WORD.findall(b.lower()))
-    if not wa and not wb:
-        return 1.0
-    return len(wa & wb) / len(wa | wb)
-
-
-def is_material_change(job, new):
-    if job.title != new.title:
-        return True
-    return similarity(job.original_description, new.description) < settings.MATERIAL_CHANGE_THRESHOLD
+def _recency(n):
+    """Sort key for 'latest first'. Lever gives a creation date; Greenhouse ids only ever increase,
+    so the id is the next best signal (its updated_at moves whenever a posting is edited)."""
+    ext = int(n.external_job_id) if n.external_job_id.isdigit() else 0
+    posted = n.posted_at.timestamp() if n.posted_at else 0
+    updated = n.source_updated_at.timestamp() if n.source_updated_at else 0
+    return (posted, ext, updated)
 
 
 @dataclass
@@ -122,6 +126,8 @@ class UpsertStats:
     updated: int = 0
     skipped: int = 0
     filtered: int = 0  # dropped by the country filter
+    summaries_reused: int = 0  # new postings that got an already-stored role summary for free
+    trimmed: int = 0  # valid jobs beyond the per-company cap (not stored / archived)
     closed: int = 0
     warning: str = ""
 
@@ -136,16 +142,30 @@ def upsert_jobs(source, raw_jobs):
     now = timezone.now()
     stats = UpsertStats(discovered=len(raw_jobs))
     existing = {j.dedupe_key: j for j in Job.objects.filter(source=source)}
-    seen, unchanged_ids, to_create, to_update = set(), [], [], []
+    seen, feed_keys, unchanged_ids, to_create, to_update = set(), set(), [], [], []
 
+    # 1) country filter + normalise + de-duplicate within the feed
+    candidates = []
     for raw in raw_jobs:
         if not matches_country_filter(raw):
             stats.filtered += 1
             continue
         n = normalise(raw)
-        if n is None or n.dedupe_key in seen:
+        if n is None or n.dedupe_key in feed_keys:
             stats.skipped += 1
             continue
+        feed_keys.add(n.dedupe_key)
+        candidates.append(n)
+
+    # 2) keep only the latest MAX_JOBS_PER_COMPANY (applied AFTER the country filter)
+    cap = settings.MAX_JOBS_PER_COMPANY
+    candidates.sort(key=_recency, reverse=True)
+    kept = candidates[:cap] if cap > 0 else candidates
+    trimmed_keys = {n.dedupe_key for n in (candidates[cap:] if cap > 0 else [])}
+    stats.trimmed = len(trimmed_keys)
+
+    # 3) insert/update the kept ones, oldest first so newer postings get higher ids
+    for n in reversed(kept):
         seen.add(n.dedupe_key)
         job = existing.get(n.dedupe_key)
         if job is None:
@@ -168,13 +188,17 @@ def upsert_jobs(source, raw_jobs):
                     first_seen_at=now,
                     last_seen_at=now,
                     content_hash=n.content_hash,
+                    experience_min=n.experience_min,
+                    experience_max=n.experience_max,
+                    qualification=n.qualification,
+                    cities=n.cities,
+                    role_hash=n.role_hash,
                 )
             )
             stats.created += 1
         elif job.content_hash == n.content_hash and job.job_url == n.url:
             unchanged_ids.append(job.pk)
         else:
-            material = is_material_change(job, n)
             job.title, job.location, job.job_url = n.title, n.location, n.url
             job.employment_type, job.workplace_type = n.employment_type, n.workplace_type
             job.department, job.seniority = n.department, n.seniority
@@ -183,17 +207,37 @@ def upsert_jobs(source, raw_jobs):
             job.source_updated_at = n.source_updated_at
             job.content_hash = n.content_hash
             job.last_seen_at, job.missed_checks, job.status = now, 0, Job.STATUS_ACTIVE
-            if material and job.summary_status == Job.SUMMARY_AI:
-                job.summary_stale = True  # the user can regenerate; we never do it automatically
+            job.experience_min, job.experience_max = n.experience_min, n.experience_max
+            job.qualification, job.cities, job.role_hash = n.qualification, n.cities, n.role_hash
+            # An existing AI summary is kept as-is: summaries are stored permanently, never regenerated.
             to_update.append(job)
             stats.updated += 1
 
-    missing_ids = [j.pk for k, j in existing.items() if k not in seen]
+    # Jobs still in the feed but pushed beyond the cap are archived (not "closed"); they come back
+    # automatically if they re-enter the latest N. Only jobs absent from the feed count as missed.
+    archive_ids = [j.pk for k, j in existing.items() if k in trimmed_keys and j.status != Job.STATUS_ARCHIVED]
+    missing_ids = [j.pk for k, j in existing.items() if k not in feed_keys]
     if not raw_jobs and existing:
         # An empty feed for a source that previously had jobs is more likely an outage
         # than every job closing at once: don't age anything out.
         stats.warning = "Portal returned 0 jobs although jobs were stored before; skipped closing check."
         missing_ids = []
+
+    # Reuse permanently stored summaries for any posting of an already-summarised role (no AI call, no quota).
+    needing = [j for j in to_create + to_update if j.summary_status != Job.SUMMARY_AI]
+    if needing:
+        hashes = list({j.role_hash for j in needing})
+        cache = {}
+        for chunk in _chunks(hashes):
+            cache.update({r.role_hash: r for r in RoleSummary.objects.filter(role_hash__in=chunk)})
+        for j in needing:
+            r = cache.get(j.role_hash)
+            if r:
+                j.summary, j.summary_status, j.summary_model, j.summarised_at = r.summary, Job.SUMMARY_AI, r.model, now
+                stats.summaries_reused += 1
+        to_update_fields_extra = ["summary", "summary_status", "summary_model", "summarised_at"]
+    else:
+        to_update_fields_extra = []
 
     from django.db import transaction
 
@@ -205,12 +249,16 @@ def upsert_jobs(source, raw_jobs):
                 [
                     "title", "location", "job_url", "employment_type", "workplace_type", "department",
                     "seniority", "original_description", "posted_at", "source_updated_at", "content_hash",
-                    "last_seen_at", "missed_checks", "status", "summary_stale",
+                    "last_seen_at", "missed_checks", "status",
+                    "experience_min", "experience_max", "qualification", "cities", "role_hash",
+                    *to_update_fields_extra,
                 ],
                 batch_size=100,
             )
         for chunk in _chunks(unchanged_ids):
             Job.objects.filter(pk__in=chunk).update(last_seen_at=now, missed_checks=0, status=Job.STATUS_ACTIVE)
+        for chunk in _chunks(archive_ids):
+            Job.objects.filter(pk__in=chunk).update(status=Job.STATUS_ARCHIVED, missed_checks=0)
         for chunk in _chunks(missing_ids):
             Job.objects.filter(pk__in=chunk).update(missed_checks=F("missed_checks") + 1)
             stats.closed += Job.objects.filter(
@@ -218,4 +266,9 @@ def upsert_jobs(source, raw_jobs):
                 status=Job.STATUS_ACTIVE,
                 missed_checks__gte=settings.MISSING_CHECKS_BEFORE_CLOSED,
             ).update(status=Job.STATUS_POSSIBLY_CLOSED)
+            # An archived (over-the-limit) job that has now vanished from the source is really gone: drop it,
+            # so storage per company stays bounded.
+            Job.objects.filter(
+                pk__in=chunk, status=Job.STATUS_ARCHIVED, missed_checks__gte=settings.MISSING_CHECKS_BEFORE_CLOSED
+            ).delete()
     return stats

@@ -9,9 +9,10 @@ from jobs.adapters.greenhouse import GreenhouseAdapter
 from jobs.adapters.http import FetchError
 from jobs.adapters.lever import LeverAdapter
 from jobs.adapters.text import html_to_text, unescape_html_content
-from jobs.models import FetchRun, Job, Source, SourceRunResult, SummaryLog
+from jobs.models import FetchRun, Job, RoleSummary, Source, SourceRunResult, SummaryLog
 from jobs.adapters import parse_board_url
-from jobs.geo import is_india
+from jobs.geo import cities_for, is_india
+from jobs.extract import experience_label, extract_experience, extract_qualification
 from jobs.pipeline import canonical_url, normalise, normalise_employment_type, upsert_jobs
 from jobs.adapters.base import RawJob
 
@@ -133,16 +134,13 @@ class UpsertTests(TestCase):
         self.assertGreaterEqual(j.last_seen_at, first)
         self.assertEqual(Job.objects.count(), 2)
 
-    def test_minor_vs_material_change_marks_summary_stale_but_never_regenerates(self):
-        long_desc = " ".join(f"word{i}" for i in range(200))
-        upsert_jobs(self.src, [self.raw("1", desc=long_desc)])
+    def test_changed_description_keeps_the_stored_ai_summary(self):
+        upsert_jobs(self.src, [self.raw("1")])
         Job.objects.update(summary_status=Job.SUMMARY_AI, summary="old")
-        upsert_jobs(self.src, [self.raw("1", desc=long_desc + " extra")])  # 1 word added: minor
-        j = Job.objects.get()
-        self.assertFalse(j.summary_stale)
         upsert_jobs(self.src, [self.raw("1", desc="Completely different text about marketing budgets and brand strategy.")])
-        j.refresh_from_db()
-        self.assertEqual((j.summary_status, j.summary, j.summary_stale), (Job.SUMMARY_AI, "old", True))
+        j = Job.objects.get()
+        self.assertEqual((j.summary_status, j.summary), (Job.SUMMARY_AI, "old"))   # stored forever, never regenerated
+        self.assertIn("marketing budgets", j.original_description)
 
     def test_grace_period_then_possibly_closed_then_reopen(self):
         upsert_jobs(self.src, [self.raw("1"), self.raw("2")])
@@ -199,6 +197,9 @@ class SummarizerTests(TestCase):
 
 @override_settings(SOURCE_DELAY_SECONDS=0, OPENAI_API_KEY="sk-test")
 class RunTests(TestCase):
+    def setUp(self):
+        Source.objects.filter(adapter_key="notice_board").delete()  # seeded by migration; tests must stay offline
+
     def test_one_failure_does_not_stop_others_and_no_summaries_are_generated(self):
         good = make_source("Good", board="good")
         bad = make_source("Bad", board="bad")
@@ -492,17 +493,15 @@ class OnDemandSummaryTests(TestCase):
         self.assertEqual(SummaryLog.objects.count(), 0)
 
     @mock.patch("jobs.summarizer.ai_summary")
-    def test_stale_summary_can_be_regenerated_and_counts(self, ai):
+    def test_summary_is_never_regenerated(self, ai):
         ai.return_value = self.ok
         self.client.force_login(self.u1)
         self.post(self.jobs[0])
-        Job.objects.filter(pk=self.jobs[0].pk).update(summary_stale=True)
-        r = self.post(self.jobs[0]).json()
-        self.assertFalse(r["summary_stale"])
-        self.assertEqual(ai.call_count, 2)
-        self.assertEqual(SummaryLog.objects.count(), 2)
-        self.post(self.jobs[0], regenerate=True)  # explicit regenerate also allowed, still capped
-        self.assertEqual(ai.call_count, 2)        # per-user cap (2) already used: refused
+        Job.objects.filter(pk=self.jobs[0].pk).update(original_description="Rewritten posting text " * 5)
+        r = self.post(self.jobs[0], regenerate=True).json()    # even an explicit request: stored summary returned
+        self.assertEqual((r["summary"], r["reused"]), ("A short summary.", True))
+        self.assertEqual(ai.call_count, 1)
+        self.assertEqual(SummaryLog.objects.count(), 1)
 
     def test_requires_login_and_me_exposes_quota_not_key(self):
         self.assertEqual(self.post(self.jobs[0]).status_code, 401)
@@ -588,3 +587,754 @@ class CatalogDiscoveryTests(TestCase):
         text = out.getvalue()
         self.assertIn("NEEDS REVIEW", text)
         self.assertIn("none in IN", text)
+
+
+@override_settings(MAX_JOBS_PER_COMPANY=5, MISSING_CHECKS_BEFORE_CLOSED=2)
+class PerCompanyCapTests(TestCase):
+    def setUp(self):
+        Source.objects.filter(adapter_key="notice_board").delete()  # seeded by migration; tests must stay offline
+        self.src = make_source("Capco", adapter="lever", board="capco")
+
+    def job(self, i, days_old=None, loc="Pune, India", ext=None, **kw):
+        from datetime import datetime, timedelta, timezone as tz
+        posted = datetime(2026, 10, 30, tzinfo=tz.utc) - timedelta(days=days_old) if days_old is not None else None
+        return RawJob(title=f"Dev {i}", url=f"https://x.com/{i}", external_id=str(ext if ext is not None else i),
+                      description="Build services with Python. " * 5, location=loc, posted_at=posted, **kw)
+
+    def stored(self, status=Job.STATUS_ACTIVE):
+        return sorted(int(j.title.split()[1]) for j in Job.objects.filter(source=self.src, status=status))
+
+    def test_keeps_the_latest_n_by_posting_date_regardless_of_feed_order(self):
+        feed = [self.job(i, days_old=i) for i in range(8)]       # job 0 is newest, job 7 oldest
+        feed.reverse()                                            # oldest first in the feed
+        stats = upsert_jobs(self.src, feed)
+        self.assertEqual(self.stored(), [0, 1, 2, 3, 4])
+        self.assertEqual((stats.created, stats.trimmed, stats.discovered), (5, 3, 8))
+        self.assertFalse(Job.objects.filter(title="Dev 7").exists())  # trimmed jobs that were never stored stay out
+
+    def test_greenhouse_style_without_dates_uses_highest_ids(self):
+        feed = [self.job(i, ext=1000 + i) for i in (3, 9, 1, 7, 5, 2, 8, 4)]
+        upsert_jobs(self.src, feed)
+        self.assertEqual(self.stored(), [4, 5, 7, 8, 9])  # the five highest posting ids
+
+    def test_undated_non_numeric_ids_keep_feed_order(self):
+        feed = [self.job(i, ext=f"uuid-{i}") for i in range(8)]
+        upsert_jobs(self.src, feed)
+        self.assertEqual(self.stored(), [0, 1, 2, 3, 4])
+
+    def test_cap_is_applied_after_the_country_filter(self):
+        newer_abroad = [self.job(100 + i, days_old=0, loc="Austin, TX") for i in range(10)]
+        india = [self.job(i, days_old=10 + i) for i in range(4)]
+        stats = upsert_jobs(self.src, newer_abroad + india)
+        self.assertEqual(self.stored(), [0, 1, 2, 3])             # foreign jobs did not use up the 5 slots
+        self.assertEqual((stats.filtered, stats.trimmed), (10, 0))
+
+    @override_settings(MAX_JOBS_PER_COMPANY=0)
+    def test_zero_means_unlimited(self):
+        upsert_jobs(self.src, [self.job(i, days_old=i) for i in range(150)])
+        self.assertEqual(Job.objects.count(), 150)
+
+    def test_newer_posting_pushes_out_the_oldest_which_is_archived_not_deleted(self):
+        upsert_jobs(self.src, [self.job(i, days_old=i + 1) for i in range(5)])        # jobs 0..4, all active
+        Job.objects.filter(title="Dev 4").update(summary="Paid-for summary", summary_status=Job.SUMMARY_AI)
+        stats = upsert_jobs(self.src, [self.job(i, days_old=i + 1) for i in range(5)] + [self.job(99, days_old=0)])
+        self.assertEqual(self.stored(), [0, 1, 2, 3, 99])
+        self.assertEqual(self.stored(Job.STATUS_ARCHIVED), [4])
+        self.assertEqual((stats.created, stats.trimmed), (1, 1))
+        archived = Job.objects.get(title="Dev 4")
+        self.assertEqual(archived.summary, "Paid-for summary")                         # nothing lost
+        # ...and it returns automatically if it re-enters the latest 5
+        upsert_jobs(self.src, [self.job(i, days_old=i + 1) for i in range(5)])
+        self.assertEqual(self.stored(Job.STATUS_ARCHIVED), [])                         # job 4 is back in the latest 5
+        # job 99 left the feed: it stays active through the closing grace period (1 miss of 2), so there are
+        # briefly 6 active; the next miss marks it possibly closed
+        self.assertEqual(self.stored(), [0, 1, 2, 3, 4, 99])
+        upsert_jobs(self.src, [self.job(i, days_old=i + 1) for i in range(5)])
+        self.assertEqual(self.stored(), [0, 1, 2, 3, 4])
+        self.assertEqual(self.stored(Job.STATUS_POSSIBLY_CLOSED), [99])
+
+    def test_already_stored_excess_is_trimmed_on_the_next_run(self):
+        with override_settings(MAX_JOBS_PER_COMPANY=0):
+            upsert_jobs(self.src, [self.job(i, days_old=i) for i in range(8)])          # stored before the cap existed
+        self.assertEqual(len(self.stored()), 8)
+        stats = upsert_jobs(self.src, [self.job(i, days_old=i) for i in range(8)])
+        self.assertEqual(self.stored(), [0, 1, 2, 3, 4])
+        self.assertEqual(self.stored(Job.STATUS_ARCHIVED), [5, 6, 7])
+        self.assertEqual(stats.trimmed, 3)
+
+    def test_archived_job_that_disappears_from_the_source_is_eventually_deleted(self):
+        full = [self.job(i, days_old=i) for i in range(7)]
+        with override_settings(MAX_JOBS_PER_COMPANY=0):
+            upsert_jobs(self.src, full)                        # all 7 stored (as before the cap existed)
+        upsert_jobs(self.src, full)                            # cap 5 now applies: jobs 5 and 6 are archived
+        self.assertEqual(self.stored(Job.STATUS_ARCHIVED), [5, 6])
+        gone = full[:5]                                        # 5 and 6 then close at the source
+        upsert_jobs(self.src, gone)                            # 1st miss: still kept (grace period)
+        self.assertEqual(self.stored(Job.STATUS_ARCHIVED), [5, 6])
+        upsert_jobs(self.src, gone)                            # 2nd miss: threshold reached -> deleted
+        self.assertEqual(Job.objects.filter(status=Job.STATUS_ARCHIVED).count(), 0)
+        self.assertEqual(Job.objects.count(), 5)
+
+    def test_each_company_gets_its_own_limit(self):
+        other = make_source("Otherco", adapter="lever", board="otherco")
+        upsert_jobs(self.src, [self.job(i, days_old=i) for i in range(9)])
+        upsert_jobs(other, [self.job(i, days_old=i) for i in range(9)])
+        self.assertEqual(Job.objects.filter(source=self.src, status="active").count(), 5)
+        self.assertEqual(Job.objects.filter(source=other, status="active").count(), 5)
+
+    def test_archived_jobs_hidden_by_default_and_counted_in_run_results(self):
+        U = get_user_model(); admin = U.objects.create_user("a", password="pw", is_staff=True)
+        with mock.patch("jobs.adapters.lever.get_json") as gj, override_settings(SOURCE_DELAY_SECONDS=0, RUN_MODE="queue"):
+            gj.return_value = [dict(LEVER_PAYLOAD[0], id=f"lv{i}", text=f"Dev {i}", country="IN",
+                                    createdAt=1790000000000 - i * 86400000) for i in range(8)]
+            run = runner.create_run(FetchRun.TRIGGER_MANUAL); runner.execute_run(run.pk)
+        self.client.force_login(admin)
+        res = SourceRunResult.objects.get(fetch_run=run)
+        self.assertEqual((res.discovered_count, res.trimmed_count), (8, 3))
+        detail = self.client.get(f"/api/fetch-runs/{run.pk}").json()["results"][0]
+        self.assertEqual(detail["over_cap"], 3)
+        self.assertEqual(self.client.get("/api/jobs").json()["count"], 5)
+        self.assertEqual(self.client.get("/api/me").json()["max_jobs_per_company"], 5)
+        self.assertEqual(self.client.get("/api/overview").json()["jobs_active"], 5)
+
+
+SAMPLE_1 = """Looking For Sales Associate For Factory Automation Company (Funded Startup)
+
+Experience - 3 - 6 years
+Location - Noida
+Qualification - Bachelor's degree in Business Administration, Marketing, Sales, or a related field
+
+Please share resumes to bhawna@marketscope.in"""
+
+
+class ExtractionTests(TestCase):
+    def test_linkedin_samples(self):
+        self.assertEqual(extract_experience(SAMPLE_1), (3, 6))
+        self.assertEqual(extract_qualification(SAMPLE_1),
+                         "Bachelor's degree in Business Administration, Marketing, Sales, or a related field")
+        self.assertEqual(extract_experience("Experience - 3 - 5 years"), (3, 5))
+        self.assertEqual(extract_qualification("Qualification - Graduate or MBA in Accounting, Finance, Commerce, or related"),
+                         "Graduate or MBA in Accounting, Finance, Commerce, or related")
+
+    def test_experience_patterns(self):
+        cases = {
+            "We need 3+ years of experience in Python.": (3, None),
+            "Requirements: 5 years of professional software development": (5, None),
+            "Min. 2 yrs exp in sales": (2, None),
+            "At least 4 years working with Kubernetes": (4, None),
+            "Exp: 2-4 yrs": (2, 4),
+            "1.5 to 3 years of relevant experience": (1, 3),
+            "Freshers are welcome to apply": (0, 1),
+            "3-5 years of experience; 2+ years with React": (2, 5),
+        }
+        for text, want in cases.items():
+            self.assertEqual(extract_experience(text), want, text)
+
+    def test_years_that_are_not_experience_are_ignored(self):
+        for text in ("We were founded 20 years ago and have grown fast.", "Over the past 10 years we have built great products",
+                     "Celebrating 25 years of innovation. You will own the roadmap.", "26 weeks parental leave, 2 years warranty",
+                     "No numbers here"):
+            self.assertEqual(extract_experience(text), (None, None), text)
+
+    def test_labels(self):
+        self.assertEqual(experience_label(3, 6), "3 - 6 years")
+        self.assertEqual(experience_label(3, None), "3+ years")
+        self.assertEqual(experience_label(0, 1), "Fresher (0 - 1 years)")
+        self.assertEqual(experience_label(2, 2), "2 years")
+        self.assertEqual(experience_label(None, None), "")
+
+    def test_qualification_patterns(self):
+        self.assertEqual(extract_qualification("• B.Tech/BE in Computer Science or equivalent"), "B.Tech/BE in Computer Science or equivalent")
+        self.assertEqual(extract_qualification("Education: MBA from a reputed institute."), "MBA from a reputed institute")
+        self.assertEqual(extract_qualification("We are an equal opportunity employer regardless of degree"), "")
+        self.assertEqual(extract_qualification("Be a great teammate"), "")   # 'Be' is not B.E.
+
+    def test_cities(self):
+        self.assertEqual(cities_for(["Bangalore, Karnataka", "Gurgaon"]), ["Bengaluru", "Gurugram"])
+        self.assertEqual(cities_for(["Remote - India"]), ["Remote"])
+        self.assertEqual(cities_for(["Noida"], "remote"), ["Noida", "Remote"])
+        self.assertEqual(cities_for(["India"]), [])
+
+
+@override_settings(RUN_MODE="queue")
+class ExperienceAndCityFilterTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("u", password="pw")
+        self.client.force_login(self.user)
+        src = make_source("Acme", adapter="lever")
+        mk = lambda i, loc, desc, **kw: RawJob(title=f"Role {i}", url=f"https://x.com/{i}", external_id=str(i), location=loc, description=desc, **kw)
+        upsert_jobs(src, [
+            mk(1, "Noida", "Experience - 3 - 6 years. Sell automation."),
+            mk(2, "Bangalore", "We need 5+ years of experience."),
+            mk(3, "Pune, India", "Freshers welcome."),
+            mk(4, "Gurgaon", "No experience stated here."),
+            mk(5, "Remote - India", "1-2 years of experience."),
+            RawJob(title="Analyst Intern", url="https://x.com/6", external_id="6", location="Noida", description="Learn a lot."),
+        ])
+
+    def titles(self, **params):
+        from urllib.parse import urlencode
+        return sorted(j["title"] for j in self.client.get("/api/jobs?" + urlencode(params)).json()["results"])
+
+    def test_experience_filter(self):
+        self.assertEqual(self.titles(experience=4, include_unspecified=0), ["Role 1"])
+        self.assertEqual(self.titles(experience=7, include_unspecified=0), ["Role 2"])               # 5+ is open-ended
+        self.assertEqual(self.titles(experience=0, include_unspecified=0), ["Analyst Intern", "Role 3"])  # internships with no stated years count as fresher roles
+        self.assertEqual(self.titles(experience=4), ["Analyst Intern", "Role 1", "Role 4"])         # unspecified included by default
+        self.assertEqual(self.client.get("/api/jobs?experience=abc").status_code, 400)
+
+    def test_city_filter_and_aliases(self):
+        self.assertEqual(self.titles(city="Noida"), ["Analyst Intern", "Role 1"])
+        self.assertEqual(self.titles(city="Bengaluru"), ["Role 2"])                                  # stored as 'Bangalore'
+        self.assertEqual(self.titles(city="Gurugram"), ["Role 4"])
+        self.assertEqual(self.titles(city="Remote"), ["Role 5"])
+        cities = {c["name"]: c["count"] for c in self.client.get("/api/filters").json()["cities"]}
+        self.assertEqual(cities["Noida"], 2)
+        self.assertEqual(list(cities)[-1], "Remote")
+
+    def test_job_payload_has_post_fields(self):
+        j = [x for x in self.client.get("/api/jobs").json()["results"] if x["title"] == "Role 1"][0]
+        self.assertEqual((j["experience"], j["experience_min"], j["experience_max"], j["cities"]), ("3 - 6 years", 3, 6, ["Noida"]))
+
+
+@override_settings(OPENAI_API_KEY="sk-test", SUMMARY_DAILY_CAP_PER_USER=5, SUMMARY_DAILY_CAP_GLOBAL=50, RUN_MODE="queue")
+class RoleSummaryReuseTests(TestCase):
+    """Summaries are stored per role forever: one AI call per role, reused by every posting of it."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("u", password="pw")
+        self.client.force_login(self.user)
+        self.src = make_source("Acme", adapter="lever")
+        self.desc = "Own the sales pipeline. 3+ years of experience. Bachelor's degree in Marketing."
+        self.ok = summarizer.SummaryResult("Stored summary.", "m", 50, 10)
+
+    def post_role(self, i, loc):
+        return RawJob(title="Sales Associate", url=f"https://x.com/{i}", external_id=str(i), location=loc, description=self.desc)
+
+    def summarise(self, job):
+        return self.client.post(f"/api/jobs/{job.pk}/summary", data="{}", content_type="application/json")
+
+    @mock.patch("jobs.summarizer.ai_summary")
+    def test_one_call_fills_every_posting_of_the_role(self, ai):
+        ai.return_value = self.ok
+        upsert_jobs(self.src, [self.post_role(1, "Noida"), self.post_role(2, "Pune, India"), self.post_role(3, "Bengaluru")])
+        noida, pune, blr = Job.objects.order_by("external_job_id")
+        self.assertEqual(self.summarise(noida).status_code, 200)
+        for j in (pune, blr):
+            j.refresh_from_db()
+            self.assertEqual((j.summary, j.summary_status), ("Stored summary.", "ai"))
+        r = self.summarise(pune).json()
+        self.assertTrue(r["reused"])
+        self.assertEqual(ai.call_count, 1)
+        self.assertEqual(SummaryLog.objects.count(), 1)              # reuse never touches the quota
+        self.assertEqual(RoleSummary.objects.count(), 1)
+
+    @mock.patch("jobs.summarizer.ai_summary")
+    def test_new_posting_of_a_summarised_role_gets_it_at_collection_time(self, ai):
+        ai.return_value = self.ok
+        upsert_jobs(self.src, [self.post_role(1, "Noida")])
+        self.summarise(Job.objects.get())
+        stats = upsert_jobs(self.src, [self.post_role(1, "Noida"), self.post_role(9, "Chennai")])
+        self.assertEqual(stats.summaries_reused, 1)
+        self.assertEqual(Job.objects.get(external_job_id="9").summary, "Stored summary.")
+        self.assertEqual(ai.call_count, 1)
+
+    @mock.patch("jobs.summarizer.ai_summary")
+    def test_summary_survives_the_job_being_deleted_and_reposted(self, ai):
+        ai.return_value = self.ok
+        upsert_jobs(self.src, [self.post_role(1, "Noida")])
+        self.summarise(Job.objects.get())
+        Job.objects.all().delete()
+        upsert_jobs(self.src, [self.post_role(42, "Noida")])
+        self.assertEqual(Job.objects.get().summary, "Stored summary.")
+        self.assertEqual(ai.call_count, 1)
+
+    @mock.patch("jobs.summarizer.ai_summary")
+    def test_different_role_still_needs_its_own_summary(self, ai):
+        ai.return_value = self.ok
+        upsert_jobs(self.src, [self.post_role(1, "Noida"),
+                               RawJob(title="Accounts Executive", url="https://x.com/2", external_id="2", location="Noida", description="Books.")])
+        self.summarise(Job.objects.get(external_job_id="1"))
+        self.assertEqual(Job.objects.get(external_job_id="2").summary_status, "none")
+
+
+class BackfillMigrationTests(TestCase):
+    def test_backfill_fills_fields_and_keeps_existing_summaries_per_role(self):
+        import importlib
+        from django.apps import apps as django_apps
+        backfill = importlib.import_module("jobs.migrations.0004_experience_cities_role_summaries").backfill
+        src = make_source("Acme", adapter="lever")
+        base = dict(source=src, company_name="Acme", title="Sales Associate", job_url="https://x.com/1",
+                    first_seen_at=timezone_now(), last_seen_at=timezone_now(), content_hash="x",
+                    original_description=SAMPLE_1, location="Noida")
+        Job.objects.create(dedupe_key="id:1", summary="Old AI text", summary_status="ai", summary_model="m", **base)
+        Job.objects.create(dedupe_key="id:2", **{**base, "location": "Gurgaon"})
+        backfill(django_apps, None)
+        a, b = Job.objects.order_by("dedupe_key")
+        self.assertEqual((a.experience_min, a.experience_max, a.cities), (3, 6, ",Noida,"))
+        self.assertTrue(a.qualification.startswith("Bachelor's degree"))
+        self.assertEqual(b.cities, ",Gurugram,")
+        self.assertEqual((b.summary, b.summary_status), ("Old AI text", "ai"))   # same role -> shared
+        self.assertEqual(RoleSummary.objects.count(), 1)
+
+
+def timezone_now():
+    from django.utils import timezone
+    return timezone.now()
+
+
+class OutdatedSettingsTests(TestCase):
+    def test_missing_settings_get_defaults_and_env_values(self):
+        import os
+        from types import SimpleNamespace
+        from jobs.defaults import apply_defaults
+        old = SimpleNamespace(OPENAI_MODEL="my-model", JOB_COUNTRY_FILTER="IN")   # like a settings.py from an older version
+        with mock.patch.dict(os.environ, {"SUMMARY_DAILY_CAP_PER_USER": "7"}):
+            missing = apply_defaults(old)
+        self.assertEqual(old.MAX_JOBS_PER_COMPANY, 100)          # the setting from the bug report
+        self.assertEqual(old.SUMMARY_DAILY_CAP_PER_USER, 7)       # .env value honoured
+        self.assertEqual(old.OPENAI_MODEL, "my-model")            # existing values untouched
+        self.assertIn("MAX_JOBS_PER_COMPANY", missing)
+        self.assertNotIn("OPENAI_MODEL", missing)
+        self.assertTrue(old.USER_AGENT.startswith("JobAggregatorBot/"))
+
+    def test_up_to_date_settings_report_nothing_missing(self):
+        from django.conf import settings
+        from jobs.defaults import APP_DEFAULTS
+        for name in APP_DEFAULTS:
+            self.assertTrue(hasattr(settings, name), name)
+
+
+class OpenAIErrorReportingTests(TestCase):
+    def resp(self, status, code=None, message=""):
+        body = {"error": {"message": message, "type": "invalid_request_error", "code": code}}
+        return mock.Mock(status_code=status, json=lambda: body)
+
+    @override_settings(OPENAI_API_KEY="sk-bad")
+    @mock.patch("jobs.summarizer.time.sleep")
+    @mock.patch("jobs.summarizer.requests.post")
+    def test_401_keeps_openais_explanation_and_does_not_retry(self, post, sleep):
+        post.return_value = self.resp(401, "invalid_api_key", "Incorrect API key provided: sk-proj-****abcd.")
+        with self.assertRaises(summarizer.SummaryAuthError) as ctx:
+            summarizer.ai_summary("T", "C", "L", "d")
+        msg = str(ctx.exception)
+        self.assertIn("invalid_api_key", msg)
+        self.assertIn("Incorrect API key provided", msg)
+        self.assertIn("check_openai", msg)
+        self.assertEqual(post.call_count, 1)
+
+    @override_settings(OPENAI_API_KEY="sk-x")
+    @mock.patch("jobs.summarizer.time.sleep")
+    @mock.patch("jobs.summarizer.requests.post")
+    def test_403_and_no_credit_are_explained(self, post, sleep):
+        post.return_value = self.resp(403, "model_not_allowed", "Project does not have access to model gpt-x")
+        with self.assertRaises(summarizer.SummaryAuthError) as ctx:
+            summarizer.ai_summary("T", "C", "L", "d")
+        self.assertIn("does not have access", str(ctx.exception))
+        post.reset_mock()
+        post.return_value = self.resp(429, "insufficient_quota", "You exceeded your current quota")
+        with self.assertRaises(summarizer.SummaryAuthError) as ctx:
+            summarizer.ai_summary("T", "C", "L", "d")
+        self.assertIn("Billing", str(ctx.exception))
+        self.assertEqual(post.call_count, 1)                      # no pointless retries
+
+    @override_settings(OPENAI_API_KEY="sk-x")
+    @mock.patch("jobs.summarizer.time.sleep")
+    @mock.patch("jobs.summarizer.requests.post")
+    def test_rate_limit_is_retried(self, post, sleep):
+        ok = mock.Mock(status_code=200, json=lambda: {"choices": [{"message": {"content": "S."}}]})
+        post.side_effect = [self.resp(429, "rate_limit_exceeded", "slow down"), ok]
+        self.assertEqual(summarizer.ai_summary("T", "C", "L", "d").text, "S.")
+
+    @override_settings(OPENAI_API_KEY="sk-bad", RUN_MODE="queue")
+    @mock.patch("jobs.summarizer.requests.post")
+    def test_dashboard_gets_the_full_reason(self, post):
+        post.return_value = self.resp(401, "invalid_api_key", "Incorrect API key provided: sk-proj-****abcd.")
+        user = get_user_model().objects.create_user("u", password="pw")
+        src = make_source("Acme", adapter="lever")
+        upsert_jobs(src, [RawJob(title="Dev", url="https://x.com/1", external_id="1", location="Pune, India", description="Python. " * 10)])
+        self.client.force_login(user)
+        r = self.client.post(f"/api/jobs/{Job.objects.get().pk}/summary", data="{}", content_type="application/json")
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("Incorrect API key provided", r.json()["error"])
+        self.assertEqual(SummaryLog.objects.count(), 0)            # failed call didn't use quota
+
+
+class DotenvParsingTests(TestCase):
+    def test_windows_and_comment_pitfalls(self):
+        from jobagg.settings import parse_dotenv
+        text = ("\ufeffOPENAI_API_KEY=sk-proj-abc123  # my key\n"
+                'OPENAI_MODEL="gpt-4o-mini"\n'
+                "export TIME_ZONE='Asia/Kolkata'\n"
+                "# comment line\n"
+                "CONTACT_URL=https://x.com/#team\n"
+                "EMPTY=\n")
+        env = parse_dotenv(text)
+        self.assertEqual(env["OPENAI_API_KEY"], "sk-proj-abc123")   # BOM and inline comment removed
+        self.assertEqual(env["OPENAI_MODEL"], "gpt-4o-mini")
+        self.assertEqual(env["TIME_ZONE"], "Asia/Kolkata")
+        self.assertEqual(env["CONTACT_URL"], "https://x.com/#team")  # '#' without a preceding space is kept
+        self.assertEqual(env["EMPTY"], "")
+
+
+class CheckOpenAICommandTests(TestCase):
+    def run_cmd(self, **settings_kw):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        with override_settings(**settings_kw):
+            call_command("check_openai", stdout=out)
+        return out.getvalue()
+
+    @mock.patch("jobs.management.commands.check_openai.requests.get")
+    def test_reports_masked_key_source_and_openai_verdict(self, get):
+        get.return_value = mock.Mock(status_code=401, json=lambda: {"error": {"code": "invalid_api_key", "message": "Incorrect API key provided"}})
+        out = self.run_cmd(OPENAI_API_KEY="sk-proj-1234567890abcdWXYZ", OPENAI_API_KEY_SOURCE="a system/user environment variable (this OVERRIDES .env)")
+        self.assertIn("sk-proj…WXYZ", out)
+        self.assertNotIn("1234567890", out)                           # never prints the full key
+        self.assertIn("IGNORED", out)
+        self.assertIn("Incorrect API key provided", out)
+        self.assertTrue(get.call_args[0][0].endswith("/models/" + __import__("django.conf").conf.settings.OPENAI_MODEL))
+
+    @mock.patch("jobs.management.commands.check_openai.requests.get")
+    def test_flags_pasted_junk_and_reports_success(self, get):
+        get.return_value = mock.Mock(status_code=200, json=lambda: {})
+        out = self.run_cmd(OPENAI_API_KEY='sk-abc "def" 1234567', OPENAI_API_KEY_SOURCE=".env")
+        self.assertIn("spaces", out)
+        self.assertIn("quotes", out)
+        self.assertIn("OK: OpenAI accepts this key", out)
+
+    def test_no_key(self):
+        self.assertIn("No key", self.run_cmd(OPENAI_API_KEY="", OPENAI_API_KEY_SOURCE="not set"))
+
+
+UPSC_PAGE = "https://www.upsc.gov.in/recruitment/recruitment-advertisement"
+RSS_FEED = """<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Notices</title>
+<item><title>Recruitment of 25 Junior Engineers on contract basis</title><link>https://example.gov.in/n/je.pdf</link>
+<description>&lt;p&gt;Walk-in interview. Last date 30/11/2026&lt;/p&gt;</description><pubDate>Mon, 02 Nov 2026 10:00:00 +0530</pubDate></item>
+<item><title>Result of Junior Engineer Examination 2026</title><link>https://example.gov.in/n/result.pdf</link></item>
+<item><title>Holiday list 2027</title><link>https://example.gov.in/n/holidays.pdf</link></item>
+</channel></rss>"""
+
+
+def upsc_fixture():
+    import os
+    return open(os.path.join(os.path.dirname(__file__), "fixtures", "upsc_like.html"), encoding="utf-8").read()
+
+
+class GovernmentNoticeExtractionTests(TestCase):
+    def test_only_real_notices_from_a_upsc_style_page(self):
+        from jobs.adapters.notice_board import extract_notices
+        for pdf_only in (True, False):
+            got = extract_notices(upsc_fixture(), UPSC_PAGE, pdf_only)
+            titles = [t for t, _, _ in got]
+            self.assertEqual(titles, ["Advertisement No.52 - 2026 (Special)",
+                                      "Advertisement No.12/2026 for Assistant Professor posts. Last date: 16/10/2026"], pdf_only)
+            self.assertEqual(got[0][1], "https://www.upsc.gov.in/sites/default/files/AdvtNo-52-2026-Special-Engl-210826.pdf")
+
+    def test_dates(self):
+        from jobs.adapters.notice_board import _parse_date
+        self.assertEqual(_parse_date("Last date: 16/10/2026", prefer_last=True).date().isoformat(), "2026-10-16")
+        self.assertEqual(_parse_date("Published 3 June 2026, closing date 30-06-2026").date().isoformat(), "2026-06-03")
+        self.assertIsNone(_parse_date("no dates here"))
+
+    def test_rss_feed(self):
+        from jobs.adapters.notice_board import parse_feed
+        items = parse_feed(RSS_FEED)
+        self.assertEqual(len(items), 3)
+        self.assertEqual(items[0][0], "Recruitment of 25 Junior Engineers on contract basis")
+        self.assertIn("Walk-in", items[0][2])
+        self.assertEqual(items[0][3].year, 2026)
+
+
+@override_settings(SOURCE_DELAY_SECONDS=0, RUN_MODE="queue")
+class GovernmentSourceTests(TestCase):
+    def setUp(self):
+        Source.objects.filter(adapter_key="notice_board").delete()
+        self.gov = Source.objects.create(company_name="UPSC", careers_url=UPSC_PAGE, adapter_key="notice_board",
+                                         sector="government", configuration_json={"url": UPSC_PAGE, "pdf_only": True})
+        self.admin = get_user_model().objects.create_user("admin", password="pw", is_staff=True)
+
+    def fetch(self, text, ctype="text/html", robots=True):
+        from jobs.adapters.notice_board import NoticeBoardAdapter
+        with mock.patch("jobs.adapters.notice_board.robots_allows", return_value=robots), \
+             mock.patch("jobs.adapters.http.get_text", return_value=(text, ctype, UPSC_PAGE)):
+            return NoticeBoardAdapter(self.gov).fetch_jobs()
+
+    def test_notices_become_india_government_jobs_and_pass_the_india_filter(self):
+        jobs = self.fetch(upsc_fixture())
+        self.assertEqual(len(jobs), 2)
+        j = jobs[1]
+        self.assertEqual((j.country, j.location, j.department), ("IN", "India", "UPSC"))
+        self.assertIn("Last date: 16 Oct 2026", j.description)
+        self.assertEqual(j.description.lower().count("last date"), 1)          # not repeated
+        self.assertNotIn("Download", j.description)
+        stats = upsert_jobs(self.gov, jobs)
+        self.assertEqual((stats.created, stats.filtered), (2, 0))
+
+    def test_rss_source_keeps_recruitment_items_only(self):
+        jobs = self.fetch(RSS_FEED, ctype="application/rss+xml")
+        self.assertEqual([j.title for j in jobs], ["Recruitment of 25 Junior Engineers on contract basis"])
+        self.assertEqual(jobs[0].location, "India")
+        upsert_jobs(self.gov, jobs)
+        self.assertEqual(Job.objects.get().employment_type, "Contract")
+
+    def test_robots_txt_is_respected(self):
+        from jobs.adapters.http import BlockedError
+        with self.assertRaises(BlockedError):
+            self.fetch(upsc_fixture(), robots=False)
+
+    def test_javascript_only_page_is_reported_clearly(self):
+        with self.assertRaises(FetchError) as ctx:
+            self.fetch('<html><body><div id="root"></div><noscript>Please enable JavaScript</noscript></body></html>')
+        self.assertIn("JavaScript", str(ctx.exception))
+
+    def test_sector_filter_and_no_ai_summary_for_notices(self):
+        upsert_jobs(self.gov, self.fetch(upsc_fixture()))
+        private = make_source("Acme", adapter="lever")
+        upsert_jobs(private, [RawJob(title="Dev", url="https://x.com/1", external_id="1", location="Pune, India", description="Python " * 9)])
+        self.client.force_login(self.admin)
+        gov_rows = self.client.get("/api/jobs?sector=government").json()["results"]
+        self.assertEqual(len(gov_rows), 2)
+        self.assertTrue(all(r["is_notice"] and r["sector"] == "government" for r in gov_rows))
+        self.assertEqual(self.client.get("/api/jobs?sector=private").json()["count"], 1)
+        self.assertEqual(self.client.get("/api/filters").json()["sectors"], {"government": 2, "private": 1})
+        r = self.client.post(f"/api/jobs/{gov_rows[0]['id']}/summary", data="{}", content_type="application/json")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("official documents", r.json()["error"])
+
+    def test_admin_adds_a_government_page(self):
+        self.client.force_login(self.admin)
+        with mock.patch("jobs.adapters.notice_board.robots_allows", return_value=True), \
+             mock.patch("jobs.adapters.http.get_text", return_value=(upsc_fixture(), "text/html", "https://psc.example.gov.in/rec")):
+            r = self.client.post("/api/sources", content_type="application/json", data=json.dumps(
+                {"kind": "government", "company_name": "Example PSC", "url": "https://psc.example.gov.in/rec", "pdf_only": True}))
+        self.assertEqual(r.status_code, 201)
+        body = r.json()
+        self.assertEqual((body["sector"], body["adapter"], body["found"]), ("government", "notice_board", 2))
+        with mock.patch("jobs.adapters.notice_board.robots_allows", return_value=True), \
+             mock.patch("jobs.adapters.http.get_text", return_value=("<html><body><a href='/x'>Home</a></body></html>", "text/html", "https://y.gov.in/")):
+            r = self.client.post("/api/sources", content_type="application/json", data=json.dumps(
+                {"kind": "government", "company_name": "Empty Board", "url": "https://y.gov.in/"}))
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("No recruitment notices", r.json()["error"])
+        self.assertFalse(Source.objects.filter(company_name="Empty Board").exists())
+        bad = self.client.post("/api/sources", content_type="application/json",
+                               data=json.dumps({"kind": "government", "company_name": "Bad", "url": "ftp://x"}))
+        self.assertEqual(bad.status_code, 400)
+
+    def test_edit_and_test_a_notice_source(self):
+        self.client.force_login(self.admin)
+        with mock.patch("jobs.adapters.notice_board.robots_allows", return_value=True), \
+             mock.patch("jobs.adapters.http.get_text", return_value=(upsc_fixture(), "text/html", UPSC_PAGE)):
+            t = self.client.post(f"/api/sources/{self.gov.pk}/test", content_type="application/json",
+                                 data=json.dumps({"adapter": "notice_board", "url": UPSC_PAGE, "pdf_only": False})).json()
+        self.assertEqual((t["ok"], t["count"]), (True, 2))
+        r = self.client.patch(f"/api/sources/{self.gov.pk}", content_type="application/json",
+                              data=json.dumps({"adapter": "notice_board", "url": "https://new.gov.in/notices", "pdf_only": False}))
+        self.assertEqual(r.status_code, 200)
+        self.gov.refresh_from_db()
+        self.assertEqual(self.gov.configuration_json, {"url": "https://new.gov.in/notices", "pdf_only": False})
+
+
+class SeededGovernmentSourcesTests(TestCase):
+    def test_migration_adds_upsc_active_and_others_inactive(self):
+        upsc = Source.objects.get(company_name="UPSC")
+        self.assertEqual((upsc.adapter_key, upsc.sector, upsc.active), ("notice_board", "government", True))
+        self.assertTrue(upsc.pdf_only)
+        self.assertFalse(Source.objects.get(company_name="Reserve Bank of India").active)
+
+
+class NoticeCityTests(TestCase):
+    def test_city_in_notice_text_becomes_the_location(self):
+        from jobs.adapters.notice_board import NoticeBoardAdapter
+        src = Source(company_name="Water Board", adapter_key="notice_board", configuration_json={"url": "https://x.gov.in/f.xml"})
+        feed = RSS_FEED.replace("Junior Engineers on contract basis", "Junior Engineers on contract basis at Noida")
+        with mock.patch("jobs.adapters.notice_board.robots_allows", return_value=True), \
+             mock.patch("jobs.adapters.http.get_text", return_value=(feed, "application/rss+xml", "https://x.gov.in/f.xml")):
+            job = NoticeBoardAdapter(src).fetch_jobs()[0]
+        self.assertEqual(job.location, "Noida")
+
+
+@override_settings(SOURCE_DELAY_SECONDS=0, STALE_RUN_MINUTES=30)
+class StuckAndStoppedRunTests(TestCase):
+    """A fetch whose process died must never block the dashboard; admins can stop a fetch."""
+
+    def setUp(self):
+        Source.objects.filter(adapter_key="notice_board").delete()
+        U = get_user_model()
+        self.admin = U.objects.create_user("admin", password="pw", is_staff=True)
+        self.viewer = U.objects.create_user("viewer", password="pw")
+
+    def running_run(self, user=None, minutes_since_heartbeat=0):
+        from datetime import timedelta
+        from django.utils import timezone
+        run = runner.create_run(FetchRun.TRIGGER_MANUAL, user=user)
+        runner._claim(run.pk)
+        src = make_source("Roblox", board="roblox")
+        SourceRunResult.objects.create(fetch_run=run, source=src, status=SourceRunResult.STATUS_RUNNING)
+        FetchRun.objects.filter(pk=run.pk).update(heartbeat_at=timezone.now() - timedelta(minutes=minutes_since_heartbeat),
+                                                 current_step="Collecting Roblox (61/84)")
+        run.refresh_from_db()
+        return run
+
+    @override_settings(RUN_MODE="thread")
+    def test_run_dead_for_days_is_released_when_the_dashboard_loads(self):
+        run = self.running_run(self.admin, minutes_since_heartbeat=4 * 24 * 60)   # like fetch #3
+        self.client.force_login(self.admin)
+        body = self.client.get("/api/overview").json()
+        self.assertIsNone(body["active_run"])
+        self.assertEqual(body["last_run"]["id"], run.pk)
+        run.refresh_from_db()
+        self.assertEqual((run.status, run.active_marker, run.current_step), ("failed", None, ""))
+        self.assertIn("server was stopped or restarted", run.error_summary)
+        self.assertEqual(SourceRunResult.objects.get(fetch_run=run).status, "failed")
+        with mock.patch("jobs.views.start_in_thread"):
+            self.assertEqual(self.client.post("/api/fetch-runs", data="{}", content_type="application/json").status_code, 202)
+
+    @override_settings(RUN_MODE="thread")
+    def test_recent_live_run_is_not_released(self):
+        run = self.running_run(self.admin, minutes_since_heartbeat=5)
+        self.client.force_login(self.admin)
+        self.assertEqual(self.client.get("/api/overview").json()["active_run"]["id"], run.pk)
+
+    @override_settings(RUN_MODE="thread")
+    def test_stop_releases_a_dashboard_run_whose_thread_is_gone(self):
+        run = self.running_run(self.admin, minutes_since_heartbeat=1)
+        self.client.force_login(self.admin)
+        r = self.client.post(f"/api/fetch-runs/{run.pk}/cancel", data="{}", content_type="application/json").json()
+        self.assertEqual((r["outcome"], r["status"], r["is_active"]), ("stopped", "cancelled", False))
+        self.assertIn("Stopped by admin", r["error_summary"])
+        self.assertIsNone(self.client.get("/api/overview").json()["active_run"])
+
+    @override_settings(RUN_MODE="queue")
+    def test_stop_lets_a_live_run_finish_its_current_company_then_stops(self):
+        for name in ("Alpha", "Bravo", "Charlie"):
+            make_source(name, board=name.lower())
+        run = runner.create_run(FetchRun.TRIGGER_MANUAL, user=self.admin)
+        calls = []
+
+        def fetch(url, params=None):
+            calls.append(url)
+            if len(calls) == 1:   # admin presses "Stop fetch" while the first company is being collected
+                self.assertEqual(runner.cancel_run(FetchRun.objects.get(pk=run.pk), self.admin), "stopping")
+            return {"jobs": [dict(GH_PAYLOAD["jobs"][0], location={"name": "Pune, India"})]}
+
+        with mock.patch("jobs.adapters.greenhouse.get_json", side_effect=fetch):
+            runner.execute_run(run.pk)
+        run.refresh_from_db()
+        self.assertEqual(len(calls), 1)                                  # Bravo and Charlie were not collected
+        self.assertEqual((run.status, run.successful_sources, run.active_marker), ("cancelled", 1, None))
+        self.assertIn("after 1 of 3 sources", run.error_summary)
+        self.assertEqual(Job.objects.count(), 1)                         # Alpha's job was kept
+        runner.create_run(FetchRun.TRIGGER_MANUAL)                       # lock is free again
+
+    @override_settings(RUN_MODE="queue")
+    def test_a_released_run_cannot_take_the_lock_back(self):
+        run = self.running_run(self.admin)
+        runner._finish_released([run.pk], FetchRun.STATUS_FAILED, "released")
+        new = runner.create_run(FetchRun.TRIGGER_MANUAL)
+        run.successful_sources = 5                                       # the old thread wakes up and saves progress
+        run.save(update_fields=runner.PROGRESS_FIELDS)
+        run.refresh_from_db(); new.refresh_from_db()
+        self.assertIsNone(run.active_marker)
+        self.assertTrue(new.active_marker)
+
+    def test_queued_run_stops_at_once_and_only_admins_can_stop(self):
+        run = runner.create_run(FetchRun.TRIGGER_SCHEDULED)
+        self.client.force_login(self.viewer)
+        self.assertEqual(self.client.post(f"/api/fetch-runs/{run.pk}/cancel", data="{}", content_type="application/json").status_code, 403)
+        self.client.force_login(self.admin)
+        r = self.client.post(f"/api/fetch-runs/{run.pk}/cancel", data="{}", content_type="application/json").json()
+        self.assertEqual((r["outcome"], r["status"]), ("stopped", "cancelled"))
+        self.assertIsNone(runner.execute_run(run.pk))                   # the worker won't pick it up afterwards
+
+
+class BulkCollectToggleTests(TestCase):
+    def setUp(self):
+        Source.objects.all().delete()
+        U = get_user_model()
+        self.admin = U.objects.create_user("admin", password="pw", is_staff=True)
+        self.viewer = U.objects.create_user("viewer", password="pw")
+        self.a, self.b, self.c = (make_source(n, board=n.lower()) for n in ("Alpha", "Bravo", "Charlie"))
+        Source.objects.filter(pk=self.c.pk).update(active=False)
+
+    def bulk(self, body):
+        return self.client.post("/api/sources/bulk-active", data=json.dumps(body), content_type="application/json")
+
+    def test_turn_all_off_then_on(self):
+        self.client.force_login(self.admin)
+        ids = [self.a.pk, self.b.pk, self.c.pk]
+        r = self.bulk({"active": False, "ids": ids}).json()
+        self.assertEqual((r["matched"], r["changed"]), (3, 2))
+        self.assertFalse(Source.objects.filter(active=True).exists())
+        r = self.bulk({"active": True, "ids": ids}).json()
+        self.assertEqual(r["changed"], 3)
+        self.assertEqual(Source.objects.filter(active=True).count(), 3)
+
+    def test_only_the_listed_sources_change(self):
+        self.client.force_login(self.admin)
+        self.bulk({"active": False, "ids": [self.a.pk]})
+        self.assertEqual(sorted(Source.objects.filter(active=True).values_list("company_name", flat=True)), ["Bravo"])
+
+    def test_validation_and_permissions(self):
+        self.client.force_login(self.viewer)
+        self.assertEqual(self.bulk({"active": False, "ids": [self.a.pk]}).status_code, 403)
+        self.client.force_login(self.admin)
+        for bad in ({"active": "no", "ids": [1]}, {"active": True, "ids": []}, {"active": True, "ids": ["1"]}, {"active": True}):
+            self.assertEqual(self.bulk(bad).status_code, 400, bad)
+        self.assertTrue(Source.objects.get(pk=self.a.pk).active)
+
+
+class AssetCacheBustingTests(TestCase):
+    def test_dashboard_links_versioned_assets(self):
+        from jobs.views import asset_version
+        user = get_user_model().objects.create_user("u", password="pw")
+        self.client.force_login(user)
+        html = self.client.get("/").content.decode()
+        v = asset_version()
+        self.assertGreater(v, 0)
+        self.assertIn(f"jobs/js/app.js?v={v}", html)
+        self.assertIn(f"jobs/css/app.css?v={v}", html)
+
+    def test_sign_in_page_links_versioned_stylesheet(self):
+        from jobs.views import asset_version
+        html = self.client.get("/login/").content.decode()
+        self.assertIn(f"jobs/css/app.css?v={asset_version()}", html)
+        self.assertIn("Sign in", html)
+
+
+class BrandLogoTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("u", password="pw")
+
+    def test_default_logo_address_is_used_in_header_sign_in_and_tab_icon(self):
+        from jobs.context_processors import brand_logo
+        with mock.patch("jobs.context_processors.finders.find", return_value=None), \
+             override_settings(BRAND_LOGO_URL="https://logo.example/logo.jpeg"):
+            self.assertEqual(brand_logo(), "https://logo.example/logo.jpeg")
+            login_html = self.client.get("/login/").content.decode()
+            self.client.force_login(self.user)
+            page_html = self.client.get("/").content.decode()
+        for html in (login_html, page_html):
+            self.assertIn('<img src="https://logo.example/logo.jpeg"', html)
+            self.assertIn('rel="icon" href="https://logo.example/logo.jpeg"', html)
+            self.assertIn("has-logo", html)
+
+    def test_a_saved_logo_file_wins(self):
+        import os, tempfile
+        from jobs.context_processors import brand_logo
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+            path = fh.name
+        try:
+            with mock.patch("jobs.context_processors.finders.find", side_effect=lambda name: path if name == "jobs/img/logo.png" else None):
+                url = brand_logo()
+            self.assertTrue(url.startswith("/static/jobs/img/logo.png?v="), url)
+        finally:
+            os.unlink(path)
+
+    def test_empty_setting_shows_the_plain_mark(self):
+        with mock.patch("jobs.context_processors.finders.find", return_value=None), override_settings(BRAND_LOGO_URL=""):
+            html = self.client.get("/login/").content.decode()
+        self.assertNotIn("has-logo", html)
+        self.assertNotIn('rel="icon"', html)

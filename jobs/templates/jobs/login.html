@@ -4,28 +4,42 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Sign in · Jobline</title>
+  {% if brand_logo %}<link rel="icon" href="{{ brand_logo }}">{% endif %}
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Instrument+Sans:wght@400;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="{% static 'jobs/css/app.css' %}">
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'jobs/css/app.css' %}?v={{ asset_version }}">
 </head>
 <body>
   <div class="login-wrap">
-    <form class="login-card panel" method="post">
-      {% csrf_token %}
+    <aside class="login-aside">
+      <span class="brand"><span class="brand-mark{% if brand_logo %} has-logo{% endif %}" aria-hidden="true">J{% if brand_logo %}<img src="{{ brand_logo }}" alt="" referrerpolicy="no-referrer" onerror="this.parentNode.classList.remove('has-logo');this.remove()">{% endif %}</span><span class="brand-name">Jobline</span></span>
       <div>
-        <h1>Jobline</h1>
-        <p>Sign in to see the jobs collected from company career pages.</p>
+        <h2>Every open role in India, ready to share.</h2>
+        <ul class="login-points">
+          <li><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>Jobs and internships from company career pages and official government notices, refreshed daily.</li>
+          <li><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>Filter by city and years of experience in a couple of clicks.</li>
+          <li><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>Turn any role into a LinkedIn or WhatsApp post in your standard format.</li>
+        </ul>
       </div>
-      {% if form.errors %}<div class="error" role="alert">Username or password is incorrect.</div>{% endif %}
-      <label class="field"><span>Username</span>
-        <input type="text" name="username" autocomplete="username" autofocus required></label>
-      <label class="field"><span>Password</span>
-        <input type="password" name="password" autocomplete="current-password" required
-               style="width:100%;padding:.5rem .65rem;border:1px solid var(--line);border-radius:4px"></label>
-      <input type="hidden" name="next" value="{{ next }}">
-      <button class="btn primary" type="submit" style="justify-content:center">Sign in</button>
-    </form>
+      <p class="login-foot">For your recruitment team. Ask an administrator for an account.</p>
+    </aside>
+    <main class="login-main">
+      <form class="login-card" method="post">
+        {% csrf_token %}
+        <div>
+          <h1>Sign in</h1>
+          <p class="lead">Welcome back. Sign in to find roles to share.</p>
+        </div>
+        {% if form.errors %}<div class="error" role="alert">That username and password don’t match. Check them and try again.</div>{% endif %}
+        <label class="field"><span>Username</span>
+          <input type="text" name="username" autocomplete="username" autofocus required></label>
+        <label class="field"><span>Password</span>
+          <input type="password" name="password" autocomplete="current-password" required></label>
+        <input type="hidden" name="next" value="{{ next }}">
+        <button class="btn primary" type="submit">Sign in</button>
+      </form>
+    </main>
   </div>
 </body>
 </html>

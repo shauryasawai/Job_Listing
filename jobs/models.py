@@ -7,12 +7,18 @@ class Source(models.Model):
 
     ADAPTER_GREENHOUSE = "greenhouse"
     ADAPTER_LEVER = "lever"
+    ADAPTER_NOTICE = "notice_board"
     ADAPTER_NONE = "unsupported"
     ADAPTER_CHOICES = [
         (ADAPTER_GREENHOUSE, "Greenhouse Job Board API"),
         (ADAPTER_LEVER, "Lever Postings API"),
+        (ADAPTER_NOTICE, "Government notice page / RSS feed"),
         (ADAPTER_NONE, "No adapter yet"),
     ]
+
+    SECTOR_PRIVATE = "private"
+    SECTOR_GOVERNMENT = "government"
+    SECTOR_CHOICES = [(SECTOR_PRIVATE, "Private company"), (SECTOR_GOVERNMENT, "Government")]
 
     STATUS_NEVER = "never"
     STATUS_SUCCESS = "success"
@@ -22,6 +28,7 @@ class Source(models.Model):
     company_name = models.CharField(max_length=120, unique=True)
     careers_url = models.URLField(max_length=500)
     adapter_key = models.CharField(max_length=30, choices=ADAPTER_CHOICES, default=ADAPTER_NONE)
+    sector = models.CharField(max_length=20, choices=SECTOR_CHOICES, default=SECTOR_PRIVATE, db_index=True)
     # Greenhouse: {"board": "stripe"}   Lever: {"board": "atlassian", "region": "global"|"eu"}
     configuration_json = models.JSONField(default=dict, blank=True)
     active = models.BooleanField(default=True)
@@ -42,6 +49,14 @@ class Source(models.Model):
         return (self.configuration_json or {}).get("board", "")
 
     @property
+    def notice_url(self):
+        return (self.configuration_json or {}).get("url", "")
+
+    @property
+    def pdf_only(self):
+        return bool((self.configuration_json or {}).get("pdf_only", True))
+
+    @property
     def region(self):
         return (self.configuration_json or {}).get("region", "global")
 
@@ -49,7 +64,12 @@ class Source(models.Model):
 class Job(models.Model):
     STATUS_ACTIVE = "active"
     STATUS_POSSIBLY_CLOSED = "possibly_closed"
-    STATUS_CHOICES = [(STATUS_ACTIVE, "Active"), (STATUS_POSSIBLY_CLOSED, "Possibly closed")]
+    STATUS_ARCHIVED = "archived"  # still open at the source but older than the latest MAX_JOBS_PER_COMPANY
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_POSSIBLY_CLOSED, "Possibly closed"),
+        (STATUS_ARCHIVED, "Over the per-company limit"),
+    ]
 
     SUMMARY_NONE = "none"  # no summary requested yet (summaries are on-demand only)
     SUMMARY_AI = "ai"
@@ -66,6 +86,12 @@ class Job(models.Model):
     department = models.CharField(max_length=200, blank=True)
     seniority = models.CharField(max_length=80, blank=True)
     original_description = models.TextField(blank=True)
+    # Extracted from the posting text (heuristic; empty/None = not stated)
+    experience_min = models.PositiveSmallIntegerField(null=True, blank=True)
+    experience_max = models.PositiveSmallIntegerField(null=True, blank=True)
+    qualification = models.CharField(max_length=200, blank=True)
+    cities = models.CharField(max_length=400, blank=True)  # ",Bengaluru,Remote,"
+    role_hash = models.CharField(max_length=64, blank=True, db_index=True)  # same title+description = same role
     job_url = models.URLField(max_length=1000)
     posted_at = models.DateTimeField(null=True, blank=True)
     source_updated_at = models.DateTimeField(null=True, blank=True)
@@ -78,7 +104,6 @@ class Job(models.Model):
 
     summary = models.TextField(blank=True)
     summary_status = models.CharField(max_length=20, choices=SUMMARY_CHOICES, default=SUMMARY_NONE)
-    summary_stale = models.BooleanField(default=False)  # posting changed materially after the summary
     summary_model = models.CharField(max_length=80, blank=True)
     summarised_at = models.DateTimeField(null=True, blank=True)
 
@@ -90,6 +115,7 @@ class Job(models.Model):
         indexes = [
             models.Index(fields=["-first_seen_at"]),
             models.Index(fields=["status", "-first_seen_at"]),
+            models.Index(fields=["experience_min", "experience_max"]),
         ]
         ordering = ["-first_seen_at", "-id"]
 
@@ -107,6 +133,7 @@ class FetchRun(models.Model):
     STATUS_COMPLETED = "completed"
     STATUS_WITH_ERRORS = "completed_with_errors"
     STATUS_FAILED = "failed"
+    STATUS_CANCELLED = "cancelled"
     ACTIVE_STATUSES = (STATUS_QUEUED, STATUS_RUNNING)
 
     trigger_type = models.CharField(max_length=20, choices=TRIGGER_CHOICES)
@@ -133,6 +160,8 @@ class FetchRun(models.Model):
     # Single-active-run guard: True while queued/running, NULL otherwise.
     # NULLs are distinct in a unique index, so only one row can ever be True.
     active_marker = models.BooleanField(null=True, blank=True, unique=True, default=None)
+    # Set by "Stop fetch": a live run stops before its next company. Only the cancel code writes it.
+    cancel_requested = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["-created_at", "-id"]
@@ -159,6 +188,7 @@ class SourceRunResult(models.Model):
     updated_count = models.PositiveIntegerField(default=0)
     skipped_count = models.PositiveIntegerField(default=0)
     filtered_count = models.PositiveIntegerField(default=0)  # dropped by the country filter
+    trimmed_count = models.PositiveIntegerField(default=0)  # beyond the per-company cap
     closed_count = models.PositiveIntegerField(default=0)
     error_message = models.TextField(blank=True)
     warnings = models.TextField(blank=True)
@@ -168,6 +198,20 @@ class SourceRunResult(models.Model):
     class Meta:
         ordering = ["source__company_name"]
         constraints = [models.UniqueConstraint(fields=["fetch_run", "source"], name="uniq_result_per_run_source")]
+
+
+class RoleSummary(models.Model):
+    """AI summaries are kept per ROLE forever: generated once, reused by every posting of the same role
+    (e.g. one role listed in five cities), and never regenerated, even if the job is later removed and re-added."""
+
+    role_hash = models.CharField(max_length=64, unique=True)
+    title = models.CharField(max_length=300)
+    summary = models.TextField()
+    model = models.CharField(max_length=80, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.title
 
 
 class SummaryLog(models.Model):

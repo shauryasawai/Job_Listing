@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import FetchRun, Job, Source, SourceRunResult
+from .models import FetchRun, Job, RoleSummary, Source, SourceRunResult, SummaryLog
 
 
 @admin.register(Source)
@@ -27,3 +27,14 @@ class ResultInline(admin.TabularInline):
 class FetchRunAdmin(admin.ModelAdmin):
     list_display = ("id", "trigger_type", "status", "started_at", "jobs_created", "jobs_updated")
     inlines = [ResultInline]
+
+
+@admin.register(RoleSummary)
+class RoleSummaryAdmin(admin.ModelAdmin):
+    list_display = ("title", "model", "created_at")
+    search_fields = ("title", "summary")
+
+
+@admin.register(SummaryLog)
+class SummaryLogAdmin(admin.ModelAdmin):
+    list_display = ("created_at", "user", "job", "model", "prompt_tokens", "completion_tokens")

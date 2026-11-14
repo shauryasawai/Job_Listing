@@ -29,3 +29,33 @@ def matches_country_filter(raw):
     if settings.JOB_COUNTRY_FILTER in ("", "ALL"):
         return True
     return is_india(raw.country, [raw.location, *raw.locations])
+
+
+# Canonical city names for the location filter (aliases map to one name).
+CITY_CANON = [
+    ("Bengaluru", r"bengaluru|bangalore"), ("Hyderabad", r"hyderabad|secunderabad"), ("Pune", r"pune"),
+    ("Chennai", r"chennai|madras"), ("Mumbai", r"mumbai|navi mumbai|thane|bombay"), ("Delhi", r"new delhi|delhi"),
+    ("Gurugram", r"gurugram|gurgaon"), ("Noida", r"noida|greater noida"), ("Kolkata", r"kolkata|calcutta"),
+    ("Ahmedabad", r"ahmedabad|gandhinagar"), ("Kochi", r"kochi|cochin"), ("Jaipur", r"jaipur"),
+    ("Chandigarh", r"chandigarh|mohali|panchkula"), ("Indore", r"indore"), ("Coimbatore", r"coimbatore"),
+    ("Thiruvananthapuram", r"thiruvananthapuram|trivandrum"), ("Bhubaneswar", r"bhubaneswar"),
+    ("Lucknow", r"lucknow"), ("Nagpur", r"nagpur"), ("Vadodara", r"vadodara|baroda"),
+    ("Visakhapatnam", r"visakhapatnam|vizag"), ("Mysuru", r"mysuru|mysore"), ("Ghaziabad", r"ghaziabad"),
+    ("Faridabad", r"faridabad"), ("Surat", r"surat"), ("Bhopal", r"bhopal"), ("Mangaluru", r"mangaluru|mangalore"),
+]
+_CITY_RES = [(name, re.compile(rf"\b({pat})\b", re.I)) for name, pat in CITY_CANON]
+REMOTE = "Remote"
+
+
+def cities_for(locations, workplace_type=""):
+    """['Bengaluru', 'Remote'] from free-text locations; ordered, de-duplicated."""
+    text = " | ".join(l for l in locations if l)
+    found = [name for name, rx in _CITY_RES if rx.search(text)]
+    if (workplace_type or "").lower() == "remote" or re.search(r"\b(remote|work from home|wfh)\b", text, re.I):
+        found.append(REMOTE)
+    return found
+
+
+def encode_cities(cities):
+    """Stored as ',Bengaluru,Remote,' so a single city can be matched with icontains(',Pune,')."""
+    return f",{','.join(cities)}," if cities else ""

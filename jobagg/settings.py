@@ -5,16 +5,38 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-def _load_dotenv(path):
-    """Tiny .env loader (no extra dependency). Real environment variables win."""
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
+def parse_dotenv(text):
+    """KEY=VALUE lines -> dict. Handles a UTF-8 BOM (Windows Notepad), `export KEY=...`, quoted values and
+    trailing ` # comments`, any of which would otherwise end up inside the value (e.g. a broken API key)."""
+    out = {}
+    for line in text.lstrip("\ufeff").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].split("\t#", 1)[0].strip()
+        out[key] = value
+    return out
+
+
+# Names already set in the real environment BEFORE .env is read. Those win over .env, which matters on
+# Windows where an old system-wide OPENAI_API_KEY silently overrides the one in .env.
+ENV_PRESET = set(os.environ)
+
+
+def _load_dotenv(path):
+    """Tiny .env loader (no extra dependency). Real environment variables win."""
+    if not path.exists():
+        return
+    for key, value in parse_dotenv(path.read_text(encoding="utf-8", errors="replace")).items():
+        os.environ.setdefault(key, value)
 
 
 _load_dotenv(BASE_DIR / ".env")
@@ -73,6 +95,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "jobs.context_processors.assets",
             ],
         },
     },
@@ -140,7 +163,11 @@ if not DEBUG:
         SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # ---------------------------------------------------------------- aggregator
-OPENAI_API_KEY = env("OPENAI_API_KEY")
+OPENAI_API_KEY = env("OPENAI_API_KEY").strip()
+OPENAI_API_KEY_SOURCE = (
+    "a system/user environment variable (this OVERRIDES .env)" if "OPENAI_API_KEY" in ENV_PRESET
+    else (".env" if OPENAI_API_KEY else "not set")
+)
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 OPENAI_PRICE_IN_PER_1M = float(env("OPENAI_PRICE_IN_PER_1M", "0") or 0)
@@ -151,16 +178,18 @@ SUMMARY_MAX_INPUT_CHARS = int(env("SUMMARY_MAX_INPUT_CHARS", "12000"))
 SUMMARY_DAILY_CAP_PER_USER = int(env("SUMMARY_DAILY_CAP_PER_USER", "30"))
 SUMMARY_DAILY_CAP_GLOBAL = int(env("SUMMARY_DAILY_CAP_GLOBAL", "100"))
 
+# Keep at most this many (latest) postings per company, counted after the country filter. 0 = no limit.
+MAX_JOBS_PER_COMPANY = int(env("MAX_JOBS_PER_COMPANY", "100"))
+
 # Keep only jobs located in this country. "IN" (India, default) or "ALL" to keep everything.
 JOB_COUNTRY_FILTER = env("JOB_COUNTRY_FILTER", "IN").upper()
 
 DAILY_FETCH_TIME = env("DAILY_FETCH_TIME", "02:00")
 RUN_MODE = env("RUN_MODE", "thread")  # "thread" | "queue"
-STALE_RUN_MINUTES = int(env("STALE_RUN_MINUTES", "90"))
+STALE_RUN_MINUTES = int(env("STALE_RUN_MINUTES", "30"))
 
 SOURCE_DELAY_SECONDS = float(env("SOURCE_DELAY_SECONDS", "1.0"))
 MISSING_CHECKS_BEFORE_CLOSED = int(env("MISSING_CHECKS_BEFORE_CLOSED", "3"))
-MATERIAL_CHANGE_THRESHOLD = float(env("MATERIAL_CHANGE_THRESHOLD", "0.95"))
 
 # Override only for testing or when routing through a proxy/mirror.
 GREENHOUSE_API_BASE = env("GREENHOUSE_API_BASE", "https://boards-api.greenhouse.io").rstrip("/")
@@ -171,6 +200,9 @@ HTTP_CONNECT_TIMEOUT = 10
 HTTP_READ_TIMEOUT = 45
 HTTP_MAX_ATTEMPTS = 3
 CONTACT_URL = env("CONTACT_URL", "https://example.com/contact")
+# Logo in the header, sign-in page and browser tab. A file saved as jobs/static/jobs/img/logo.(png|jpg|jpeg|webp|svg)
+# is used first; otherwise this address. Leave empty to show the plain "J" mark.
+BRAND_LOGO_URL = env("BRAND_LOGO_URL", "https://www.marketscope.in/_next/image?url=%2Fimg%2Flogo-marketscope.jpeg&w=96&q=75")
 USER_AGENT = f"JobAggregatorBot/1.0 (+{CONTACT_URL})"
 
 LOGGING = {

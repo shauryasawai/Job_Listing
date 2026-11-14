@@ -184,7 +184,9 @@ class Command(BaseCommand):
                 self.stdout.write(f"{name:<26} {hit['adapter']}:{hit['board']} has {total} jobs but none in {country}: skipped")
                 continue
             added += 1
-            self.stdout.write(self.style.SUCCESS(f"{name:<26} {hit['adapter']}:{hit['board']}  {local} of {total} jobs match {country}"))
+            cap = settings.MAX_JOBS_PER_COMPANY
+            kept_note = f" (latest {cap} kept)" if cap > 0 and local > cap else ""
+            self.stdout.write(self.style.SUCCESS(f"{name:<26} {hit['adapter']}:{hit['board']}  {local} of {total} jobs match {country}{kept_note}"))
             if opts["apply"]:
                 Source.objects.create(company_name=name, careers_url=public_url(hit), adapter_key=hit["adapter"],
                                       configuration_json=config_for(hit))
