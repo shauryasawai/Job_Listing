@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/jobs/<int:pk>/summary", views.job_summary),
     path("api/sources", views.sources),
     path("api/sources/bulk-active", views.sources_bulk_active),
+    path("api/sources/remove-unsupported", views.sources_remove_unsupported),
     path("api/sources/<int:pk>", views.source_update),
     path("api/sources/<int:pk>/test", views.source_test),
     path("api/fetch-runs", views.fetch_runs),

@@ -91,6 +91,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .btn.signal { background: var(--signal); border-color: var(--signal); color: var(--ink); }
 .btn.signal:hover { background: #e6a30d; border-color: #e6a30d; }
 .btn-outline { border-color: var(--brand); color: var(--brand-ink); }
+.btn.danger { background: var(--err); border-color: var(--err); color: #fff; }
+.btn.danger:hover { background: #9c2e22; border-color: #9c2e22; color: #fff; }
 .btn-outline:hover { background: var(--brand-soft); border-color: var(--brand); color: var(--brand-ink); }
 .btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
 .btn.ghost:hover { background: var(--surface-2); color: var(--ink); border-color: transparent; }
@@ -322,6 +324,18 @@ dialog.wide { width: min(1000px, calc(100% - 32px)); }
 .test-result { font-size: 14px; padding: 10px 12px; border-radius: var(--r-md); background: var(--brand-soft); color: var(--brand-ink); overflow-wrap: anywhere; }
 .test-result.bad { background: var(--err-soft); color: var(--err); }
 .post-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 20px; }
+.post-head { display: flex; justify-content: space-between; align-items: center; gap: 12px 24px; flex-wrap: wrap; }
+.post-head h2 { margin: 0; }
+.tabs { display: inline-flex; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-md); padding: 3px; gap: 3px; }
+.tabs button { min-height: 34px; padding: 0 16px; border: 0; background: transparent; border-radius: var(--r-sm); font-size: 14px; font-weight: 500; color: var(--muted); cursor: pointer; }
+.tabs button[aria-selected="true"] { background: var(--surface); color: var(--brand-ink); font-weight: 600; box-shadow: var(--shadow-1); }
+.tabs button:disabled { opacity: .45; cursor: not-allowed; }
+.field-label { display: block; font-size: 13px; font-weight: 600; color: var(--ink-2); margin-bottom: 6px; }
+#post-canvas { display: block; width: 100%; height: auto; border: 1px solid var(--line); border-radius: var(--r-md); background: #fff; box-shadow: var(--shadow-1); }
+#post-image-pane .warn-text { margin-top: 8px; }
+.action-group { display: inline-flex; gap: 10px; flex-wrap: wrap; }
+.field small { font-weight: 400; }
+dialog.wide { max-height: calc(100vh - 32px); overflow-y: auto; }
 .post-fields, #post-single-fields { display: grid; gap: 12px; align-content: start; }
 .post-preview textarea { background: var(--surface-2); font-family: var(--font-body); }
 #toasts { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); z-index: 70; display: grid; gap: 8px; justify-items: center; width: max-content; max-width: calc(100% - 32px); }

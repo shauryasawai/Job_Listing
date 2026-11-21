@@ -155,9 +155,3 @@ def excerpt(description, max_words=45):
     if len(parts) > max_words + 20:
         text = " ".join(parts[: max_words + 20]) + "…"
     return text
-
-
-def estimated_cost(prompt_tokens, completion_tokens):
-    return (
-        prompt_tokens * settings.OPENAI_PRICE_IN_PER_1M + completion_tokens * settings.OPENAI_PRICE_OUT_PER_1M
-    ) / 1_000_000

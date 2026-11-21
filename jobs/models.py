@@ -7,11 +7,19 @@ class Source(models.Model):
 
     ADAPTER_GREENHOUSE = "greenhouse"
     ADAPTER_LEVER = "lever"
+    ADAPTER_ASHBY = "ashby"
+    ADAPTER_SMARTRECRUITERS = "smartrecruiters"
+    ADAPTER_WORKABLE = "workable"
+    ADAPTER_RECRUITEE = "recruitee"
     ADAPTER_NOTICE = "notice_board"
     ADAPTER_NONE = "unsupported"
     ADAPTER_CHOICES = [
         (ADAPTER_GREENHOUSE, "Greenhouse Job Board API"),
         (ADAPTER_LEVER, "Lever Postings API"),
+        (ADAPTER_ASHBY, "Ashby Job Posting API"),
+        (ADAPTER_SMARTRECRUITERS, "SmartRecruiters Posting API"),
+        (ADAPTER_WORKABLE, "Workable jobs feed"),
+        (ADAPTER_RECRUITEE, "Recruitee Careers API"),
         (ADAPTER_NOTICE, "Government notice page / RSS feed"),
         (ADAPTER_NONE, "No adapter yet"),
     ]

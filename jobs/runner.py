@@ -113,10 +113,6 @@ def _progress(run, step, **fields):
     run.save(update_fields=["current_step", "heartbeat_at", *fields.keys()])
 
 
-class _Cancelled(Exception):
-    pass
-
-
 def _cancel_requested(run):
     return FetchRun.objects.filter(pk=run.pk, cancel_requested=True).exists()
 

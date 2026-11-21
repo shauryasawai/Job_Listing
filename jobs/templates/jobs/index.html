@@ -7,7 +7,7 @@
   {% if brand_logo %}<link rel="icon" href="{{ brand_logo }}">{% endif %}
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Instrument+Sans:wght@400;500;600&family=Lato:wght@400;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{% static 'jobs/css/app.css' %}?v={{ asset_version }}">
 </head>
 <body>
@@ -48,36 +48,82 @@
 
   <div id="select-bar" class="select-bar" hidden></div>
 
-  <dialog id="post-dialog" class="wide">
+  <dialog id="post-dialog" class="wide" aria-labelledby="post-title"
+          data-template="{% static 'jobs/img/post-template.png' %}?v={{ asset_version }}">
     <form method="dialog" onsubmit="return false">
-      <h2 id="post-title">Create post</h2>
+      <div class="post-head">
+        <h2 id="post-title">Create post</h2>
+        <div class="tabs" role="tablist" aria-label="Post type">
+          <button type="button" role="tab" id="tab-text" aria-controls="post-text-pane" aria-selected="true">Text post</button>
+          <button type="button" role="tab" id="tab-image" aria-controls="post-image-pane" aria-selected="false">Image post</button>
+        </div>
+      </div>
       <div class="post-grid">
         <div class="post-fields">
           <div id="post-single-fields">
-            <label class="field"><span>Role</span><input type="text" id="post-role"></label>
+            <label class="field"><span>Role (Position)</span><input type="text" id="post-role" placeholder="e.g. Executive (Accounts) - (9 Months Contractual Role)"></label>
             <label class="field"><span>Experience</span><input type="text" id="post-exp" placeholder="e.g. 3 - 6 years"></label>
             <label class="field"><span>Location</span><input type="text" id="post-loc" placeholder="e.g. Noida"></label>
             <label class="field"><span>Qualification</span><input type="text" id="post-qual" placeholder="e.g. Bachelor's degree in Marketing"></label>
           </div>
-          <label class="field"><span>Describe the company as (optional)</span>
-            <input type="text" id="post-company" placeholder="e.g. Factory Automation Company (Funded Startup)"></label>
-          <label class="field"><span>Resumes to (email)</span><input type="text" id="post-email" placeholder="you@company.com" autocomplete="email"></label>
-          <p id="post-email-hint" class="warn-text" hidden>That doesn’t look like an email address.</p>
-          <label class="check"><input type="checkbox" id="post-link"> Add a link to the original posting</label>
+          <div id="post-text-fields" class="stack">
+            <label class="field"><span>Describe the company as (optional)</span>
+              <input type="text" id="post-company" placeholder="e.g. Factory Automation Company (Funded Startup)"></label>
+            <label class="field"><span>Resumes to (email)</span><input type="text" id="post-email" placeholder="you@company.com" autocomplete="email"></label>
+            <p id="post-email-hint" class="warn-text" hidden>That doesn’t look like an email address.</p>
+            <label class="check" id="post-link-row"><input type="checkbox" id="post-link"> Add a link to the original posting</label>
+          </div>
+          <div id="post-image-fields" class="stack" hidden>
+            <label class="field"><span>Requirements <small class="muted-text">(one per line)</small></span>
+              <textarea id="post-req" rows="4" placeholder="3–5 years of relevant experience in accounting…"></textarea></label>
+            <label class="field"><span>Responsibilities <small class="muted-text">(one per line)</small></span>
+              <textarea id="post-resp" rows="4" placeholder="Create purchase orders in Zoho…"></textarea></label>
+            <p id="post-extract-note" class="muted-text" hidden></p>
+            <label class="check"><input type="checkbox" id="post-qr"> Add a QR code and “visit … to apply” line</label>
+            <label class="field" id="post-qr-url-row"><span>QR code and link address</span>
+              <input type="text" id="post-qr-url" placeholder="https://career.marketscope.in/jobs" spellcheck="false"></label>
+          </div>
         </div>
         <div class="post-preview">
-          <label class="field"><span>Post text (you can edit it; changing a field rebuilds it)</span>
-            <textarea id="post-text" rows="16" spellcheck="true"></textarea></label>
-          <p id="post-warn" class="warn-text" hidden></p>
+          <div id="post-text-pane" role="tabpanel" aria-labelledby="tab-text">
+            <label class="field"><span>Post text (you can edit it; changing a field rebuilds it)</span>
+              <textarea id="post-text" rows="16" spellcheck="true"></textarea></label>
+            <p id="post-warn" class="warn-text" hidden></p>
+          </div>
+          <div id="post-image-pane" role="tabpanel" aria-labelledby="tab-image" hidden>
+            <span class="field-label">Preview</span>
+            <canvas id="post-canvas" width="1600" height="899" role="img" aria-label="Preview of the image post"></canvas>
+            <p id="post-image-warn" class="warn-text" hidden></p>
+          </div>
         </div>
       </div>
       <div class="actions">
         <button class="btn" type="button" id="post-close">Close</button>
-        <a class="btn" id="post-wa" href="#" target="_blank" rel="noopener noreferrer">Share on WhatsApp</a>
-        <button class="btn" type="button" id="post-linkedin">Copy and open LinkedIn</button>
-        <button class="btn primary" type="button" id="post-copy">Copy text</button>
+        <span id="post-text-actions" class="action-group">
+          <a class="btn" id="post-wa" href="#" target="_blank" rel="noopener noreferrer">WhatsApp (text)</a>
+          <button class="btn" type="button" id="post-linkedin" hidden>Copy and open LinkedIn</button>
+          <button class="btn" type="button" id="post-copy">Copy text</button>
+        </span>
+        <span id="post-image-actions" class="action-group" hidden>
+          <button class="btn" type="button" id="post-copy-image">Copy image</button>
+          <button class="btn" type="button" id="post-download">Download PNG</button>
+        </span>
+        <span id="post-both-actions" class="action-group">
+          <button class="btn" type="button" id="post-linkedin-both">LinkedIn (text + image)</button>
+          <button class="btn primary" type="button" id="post-share-both">Share text + image</button>
+        </span>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="ask-dialog" aria-labelledby="ask-title">
+    <h2 id="ask-title"></h2>
+    <p id="ask-text"></p>
+    <p id="ask-detail" class="muted-text" style="margin-top:8px;max-height:160px;overflow:auto"></p>
+    <div class="actions">
+      <button class="btn" type="button" id="ask-cancel">Cancel</button>
+      <button class="btn danger" type="button" id="ask-ok"></button>
+    </div>
   </dialog>
 
   <dialog id="add-dialog">
@@ -85,14 +131,14 @@
       <h2>Add a source</h2>
       <label class="field"><span>Type</span>
         <select id="add-kind">
-          <option value="company">Company job board (Greenhouse or Lever link)</option>
+          <option value="company">Company job board link (Greenhouse, Lever, Ashby, SmartRecruiters, Workable, Recruitee)</option>
           <option value="government">Government notice page or RSS feed (official site)</option>
         </select></label>
       <label class="field"><span id="add-name-label">Company name</span><input type="text" id="add-name" required maxlength="120" autocomplete="off"></label>
       <div id="add-company-fields" class="stack">
-        <p style="margin:0;color:var(--muted)">Paste the company's Greenhouse or Lever job board link. We check it first, then fetch its jobs.</p>
+        <p style="margin:0;color:var(--muted)">Paste the company's job board link from Greenhouse, Lever, Ashby, SmartRecruiters, Workable or Recruitee. We check it first, then fetch its jobs.</p>
         <label class="field"><span>Job board link</span>
-          <input type="text" id="add-link" placeholder="https://jobs.lever.co/company or https://boards.greenhouse.io/company" autocomplete="off" spellcheck="false"></label>
+          <input type="text" id="add-link" placeholder="e.g. https://jobs.lever.co/company or https://jobs.ashbyhq.com/company" autocomplete="off" spellcheck="false"></label>
       </div>
       <div id="add-gov-fields" class="stack" hidden>
         <p style="margin:0;color:var(--muted)">Paste the official page that lists recruitment notices (for example a “Recruitment” or “Advertisements” page), or the site’s RSS feed. We check it first; only recruitment notices are kept.</p>
@@ -129,6 +175,7 @@
     </form>
   </dialog>
 
+  <script src="{% static 'jobs/js/vendor/qrcode.js' %}"></script>
   <script src="{% static 'jobs/js/app.js' %}?v={{ asset_version }}"></script>
 </body>
 </html>

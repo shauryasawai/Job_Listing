@@ -205,7 +205,7 @@ class RunTests(TestCase):
         bad = make_source("Bad", board="bad")
         make_source("NoAdapter", adapter="unsupported", board="")
 
-        def fake(url, params=None):
+        def fake(url, params=None, **kw):
             if "/bad/" in url:
                 raise FetchError("boom")
             return GH_PAYLOAD
@@ -350,7 +350,7 @@ class DiscoverTests(TestCase):
         visa = make_source("Visa", adapter="unsupported", board="")
         atl = make_source("Atlassian", adapter="unsupported", board="")
 
-        def responder(url, params=None):
+        def responder(url, params=None, **kw):
             if url.endswith("/v1/boards/stripe"):
                 return {"name": "Stripe, Inc."}                      # equal after dropping suffix: verified
             if url.endswith("/v1/boards/visa"):
@@ -556,7 +556,7 @@ class CatalogDiscoveryTests(TestCase):
         from jobs.adapters.http import NotFoundError
         make_source("Existing", adapter="greenhouse", board="existing")
 
-        def responder(url, params=None):
+        def responder(url, params=None, **kw):
             if url.endswith("/v1/boards/indiaco"):
                 return {"name": "IndiaCo Pvt Ltd"}
             if url.endswith("/v1/boards/usonly"):
@@ -565,7 +565,7 @@ class CatalogDiscoveryTests(TestCase):
                 return {"name": "Lookalike Cat Rescue"}
             raise NotFoundError(url)
 
-        def fetch(url, params=None):
+        def fetch(url, params=None, **kw):
             if "indiaco" in url:
                 return {"jobs": [dict(GH_PAYLOAD["jobs"][0], location={"name": "Bengaluru, India"})]}
             return {"jobs": [GH_PAYLOAD["jobs"][0]]}  # NYC only
@@ -1214,7 +1214,7 @@ class StuckAndStoppedRunTests(TestCase):
         run = runner.create_run(FetchRun.TRIGGER_MANUAL, user=self.admin)
         calls = []
 
-        def fetch(url, params=None):
+        def fetch(url, params=None, **kw):
             calls.append(url)
             if len(calls) == 1:   # admin presses "Stop fetch" while the first company is being collected
                 self.assertEqual(runner.cancel_run(FetchRun.objects.get(pk=run.pk), self.admin), "stopping")
@@ -1338,3 +1338,368 @@ class BrandLogoTests(TestCase):
             html = self.client.get("/login/").content.decode()
         self.assertNotIn("has-logo", html)
         self.assertNotIn('rel="icon"', html)
+
+
+class ImagePostAssetsTests(TestCase):
+    def test_composer_has_template_and_qr_library(self):
+        from django.contrib.staticfiles import finders
+        self.assertTrue(finders.find("jobs/img/post-template.png"))
+        self.assertTrue(finders.find("jobs/js/vendor/qrcode.js"))
+        self.client.force_login(get_user_model().objects.create_user("u", password="pw"))
+        html = self.client.get("/").content.decode()
+        self.assertIn("jobs/img/post-template.png", html)
+        self.assertIn("jobs/js/vendor/qrcode.js", html)
+        self.assertIn('id="tab-image"', html)
+        self.assertIn('id="post-share-both"', html)
+        self.assertIn('id="post-linkedin-both"', html)
+
+
+class RefreshSourcesTests(TestCase):
+    def setUp(self):
+        Source.objects.all().delete()
+        self.keep_gh = make_source("Stripe", board="stripe")
+        self.keep_gov = Source.objects.create(company_name="SBI", careers_url="https://sbi.co.in", adapter_key="notice_board",
+                                              sector="government", configuration_json={"url": "https://sbi.co.in/careers"})
+        for n in ("Google", "Microsoft", "Amazon"):
+            Source.objects.create(company_name=n, careers_url=f"https://{n.lower()}.com/careers")
+        upsert_jobs(self.keep_gh, [RawJob(title="Dev", url="https://x.com/1", external_id="1", location="Pune, India", description="Python " * 9)])
+
+    def run_cmd(self, *args, responder=None, fetch=None):
+        import os, tempfile
+        from io import StringIO
+        from django.core.management import call_command
+        from jobs.adapters.http import NotFoundError
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("IndiaCo\nUSOnly\nNowhere\n")
+        out = StringIO()
+        responder = responder or (lambda url, params=None, **kw: {"name": "IndiaCo"} if url.endswith("/boards/indiaco")
+                                  else ({"name": "USOnly Inc"} if url.endswith("/boards/usonly") else (_ for _ in ()).throw(NotFoundError(url))))
+        fetch = fetch or (lambda url, params=None, **kw: {"jobs": [dict(GH_PAYLOAD["jobs"][0], location={"name": "Bengaluru, India" if "indiaco" in url else "Austin, TX"})]})
+        try:
+            with mock.patch("jobs.management.commands.discover_boards.get_json", side_effect=responder), \
+                 mock.patch("jobs.adapters.greenhouse.get_json", side_effect=fetch):
+                call_command("refresh_sources", "--names-file", fh.name, "--delay", "0", *args, stdout=out)
+        finally:
+            os.unlink(fh.name)
+        return out.getvalue()
+
+    def test_removes_unsupported_and_adds_only_verified_india_boards(self):
+        out = self.run_cmd()
+        names = set(Source.objects.values_list("company_name", flat=True))
+        self.assertEqual(names, {"Stripe", "SBI", "IndiaCo"})                # Google/Microsoft/Amazon gone; USOnly skipped
+        self.assertEqual(Source.objects.get(company_name="IndiaCo").adapter_key, "greenhouse")
+        self.assertTrue(Source.objects.get(company_name="IndiaCo").active)
+        self.assertEqual(Job.objects.count(), 1)                              # existing collected jobs untouched
+        self.assertIn("Removed 3 sources", out)
+        self.assertIn("none in IN", out)
+
+    def test_dry_run_changes_nothing(self):
+        before = sorted(Source.objects.values_list("company_name", flat=True))
+        out = self.run_cmd("--dry-run")
+        self.assertEqual(sorted(Source.objects.values_list("company_name", flat=True)), before)
+        self.assertIn("Would remove 3 sources", out)
+        self.assertIn("dry run", out.lower())
+
+    def test_skip_discovery_only_removes(self):
+        self.run_cmd("--skip-discovery")
+        self.assertEqual(set(Source.objects.values_list("company_name", flat=True)), {"Stripe", "SBI"})
+
+    def test_dashboard_button_endpoint(self):
+        U = get_user_model()
+        viewer = U.objects.create_user("v", password="pw"); admin = U.objects.create_user("a", password="pw", is_staff=True)
+        url = "/api/sources/remove-unsupported"
+        self.client.force_login(viewer)
+        self.assertEqual(self.client.post(url, data='{"confirm": true}', content_type="application/json").status_code, 403)
+        self.client.force_login(admin)
+        self.assertEqual(self.client.post(url, data="{}", content_type="application/json").status_code, 400)   # must confirm
+        r = self.client.post(url, data='{"confirm": true}', content_type="application/json").json()
+        self.assertEqual((r["removed"], r["jobs_removed"], r["names"]), (3, 0, ["Amazon", "Google", "Microsoft"]))
+        self.assertEqual(set(Source.objects.values_list("company_name", flat=True)), {"Stripe", "SBI"})
+
+    def test_catalog_has_no_duplicates_or_unfetchable_seed_names(self):
+        from jobs.seed_data import CATALOG
+        self.assertEqual(len(CATALOG), len({n.lower() for n in CATALOG}))
+        self.assertGreaterEqual(len(CATALOG), 250)
+
+
+# ---- More job-board platforms (Ashby, SmartRecruiters, Workable, Recruitee) -------------------------------------
+ASHBY_PAYLOAD = {"apiVersion": "1", "jobs": [
+    {"id": "a1", "title": "Backend Engineer", "department": "Engineering", "location": "Bengaluru",
+     "secondaryLocations": [{"location": "Remote - India", "address": {"postalAddress": {"addressCountry": "India"}}}],
+     "employmentType": "FullTime", "workplaceType": "Hybrid", "isListed": True, "publishedAt": "2026-11-01T10:00:00.000+00:00",
+     "jobUrl": "https://jobs.ashbyhq.com/acme/a1", "descriptionPlain": "Acme is hiring. 3+ years of Python. B.Tech in CS.",
+     "address": {"postalAddress": {"addressLocality": "Bengaluru", "addressRegion": "Karnataka", "addressCountry": "India"}}},
+    {"id": "a2", "title": "Hidden", "isListed": False, "jobUrl": "https://jobs.ashbyhq.com/acme/a2"},
+    {"id": "a3", "title": "Account Executive", "location": "London", "employmentType": "Intern",
+     "jobUrl": "https://jobs.ashbyhq.com/acme/a3", "descriptionPlain": "Acme sales.",
+     "address": {"postalAddress": {"addressLocality": "London", "addressCountry": "United Kingdom"}}},
+]}
+SR_LIST = {"offset": 0, "limit": 100, "totalFound": 2, "content": [
+    {"id": "111", "name": "Data Analyst", "releasedDate": "2026-11-02T08:00:00.000Z",
+     "company": {"identifier": "Acme", "name": "Acme Ltd"},
+     "location": {"city": "Pune", "region": "MH", "country": "in", "remote": False, "fullLocation": "Pune, MH, India"},
+     "typeOfEmployment": {"label": "Full-time"}, "experienceLevel": {"label": "Mid-Senior Level"},
+     "department": {"label": "Analytics"}},
+    {"id": "222", "name": "Ops Intern", "releasedDate": "2026-10-01T08:00:00.000Z",
+     "company": {"identifier": "Acme", "name": "Acme Ltd"},
+     "location": {"city": "Noida", "country": "in", "remote": True}, "typeOfEmployment": {"label": "Intern"}},
+]}
+SR_DETAIL = {"postingUrl": "https://jobs.smartrecruiters.com/Acme/111-data-analyst",
+             "jobAd": {"sections": {"jobDescription": {"title": "Job Description", "text": "<p>Build dashboards.</p>"},
+                                    "qualifications": {"title": "Qualifications", "text": "<ul><li>2-4 years of SQL</li></ul>"}}}}
+WORKABLE_PAYLOAD = {"name": "Acme", "jobs": [
+    {"title": "Accounts Executive", "shortcode": "ABC123", "employment_type": "Full-time", "telecommuting": False,
+     "department": "Finance", "url": "https://apply.workable.com/j/ABC123", "published_on": "2026-11-03",
+     "country": "India", "city": "Noida", "state": "Uttar Pradesh", "education": "Bachelor's Degree",
+     "description": "<p>Handle invoices in Zoho.</p>", "requirements": "<ul><li>3-5 years in accounts</li></ul>",
+     "locations": [{"country": "India", "countryCode": "IN", "city": "Noida", "region": "Uttar Pradesh"}]}]}
+RECRUITEE_PAYLOAD = {"offers": [
+    {"id": 9, "title": "QA Engineer", "status": "published", "company_name": "Acme", "location": "Hyderabad, India",
+     "city": "Hyderabad", "country_code": "IN", "careers_url": "https://acme.recruitee.com/o/qa-engineer",
+     "description": "<p>Test things.</p>", "requirements": "<p>1-3 years of Selenium.</p>",
+     "employment_type_code": "fulltime", "remote": False, "department": "Quality",
+     "published_at": "2026-11-04 09:30:00 UTC"},
+    {"id": 10, "title": "Draft", "status": "draft", "careers_url": "https://acme.recruitee.com/o/draft"}]}
+
+
+class MorePlatformAdapterTests(TestCase):
+    def test_ashby(self):
+        from jobs.adapters.ashby import AshbyAdapter
+        with mock.patch("jobs.adapters.ashby.get_json", return_value=ASHBY_PAYLOAD) as gj:
+            jobs = AshbyAdapter(make_source(adapter="ashby")).fetch_jobs()
+        self.assertTrue(gj.call_args[0][0].endswith("/posting-api/job-board/acme"))
+        self.assertEqual([j.title for j in jobs], ["Backend Engineer", "Account Executive"])   # unlisted skipped
+        j = jobs[0]
+        self.assertEqual((j.external_id, j.country, j.employment_type, j.workplace_type), ("a1", "India", "Full-time", "hybrid"))
+        self.assertIn("Remote - India", j.locations)
+        self.assertIn("B.Tech", j.description)
+        self.assertEqual(j.posted_at.year, 2026)
+        self.assertEqual(jobs[1].employment_type, "Internship")
+        from jobs.geo import matches_country_filter
+        self.assertEqual([matches_country_filter(x) for x in jobs], [True, False])
+
+    def test_smartrecruiters_lists_india_and_fetches_details_up_to_cap(self):
+        from jobs.adapters.smartrecruiters import SmartRecruitersAdapter
+        calls = []
+
+        def fake(url, params=None, **kw):
+            calls.append((url, params))
+            return SR_DETAIL if url.endswith("/111") or url.endswith("/222") else SR_LIST
+        with mock.patch("jobs.adapters.smartrecruiters.get_json", side_effect=fake), override_settings(MAX_JOBS_PER_COMPANY=1):
+            jobs = SmartRecruitersAdapter(make_source(adapter="smartrecruiters", board="Acme")).fetch_jobs()
+        self.assertEqual(calls[0][1]["country"], "in")
+        self.assertEqual(len(calls), 2)                     # one list call + details for the newest 1 only
+        self.assertEqual(jobs[0].url, "https://jobs.smartrecruiters.com/Acme/111-data-analyst")
+        self.assertIn("2-4 years of SQL", jobs[0].description)
+        self.assertEqual((jobs[0].country, jobs[0].seniority, jobs[0].department), ("IN", "Mid-Senior Level", "Analytics"))
+        self.assertEqual((jobs[1].url, jobs[1].workplace_type), ("https://jobs.smartrecruiters.com/Acme/222", "remote"))
+
+    def test_smartrecruiters_counting_skips_details(self):
+        from jobs.adapters.smartrecruiters import SmartRecruitersAdapter
+        with mock.patch("jobs.adapters.smartrecruiters.get_json", return_value=SR_LIST) as gj:
+            a = SmartRecruitersAdapter(make_source(adapter="smartrecruiters", board="Acme"))
+            a.with_details = False
+            self.assertEqual(len(a.fetch_jobs()), 2)
+        self.assertEqual(gj.call_count, 1)
+
+    def test_workable(self):
+        from jobs.adapters.workable import WorkableAdapter
+        with mock.patch("jobs.adapters.workable.get_json", return_value=WORKABLE_PAYLOAD) as gj:
+            jobs = WorkableAdapter(make_source(adapter="workable")).fetch_jobs()
+        self.assertEqual(gj.call_args[1]["params"], {"details": "true"})
+        j = jobs[0]
+        self.assertEqual((j.external_id, j.location, j.country), ("ABC123", "Noida, Uttar Pradesh, India", "India"))
+        self.assertIn("3-5 years in accounts", j.description)
+        self.assertIn("Education: Bachelor's Degree", j.description)
+        self.assertEqual(j.posted_at.date().isoformat(), "2026-11-03")
+
+    def test_recruitee(self):
+        from jobs.adapters.recruitee import RecruiteeAdapter
+        with mock.patch("jobs.adapters.recruitee.get_json", return_value=RECRUITEE_PAYLOAD) as gj:
+            jobs = RecruiteeAdapter(make_source(adapter="recruitee")).fetch_jobs()
+        self.assertEqual(gj.call_args[0][0], "https://acme.recruitee.com/api/offers/")
+        self.assertEqual(len(jobs), 1)                       # draft skipped
+        j = jobs[0]
+        self.assertEqual((j.country, j.employment_type, j.posted_at.hour), ("IN", "Full-time", 9))
+        self.assertIn("Selenium", j.description)
+
+    def test_jobs_are_stored_with_experience_and_city(self):
+        from jobs.adapters.workable import WorkableAdapter
+        src = make_source(adapter="workable")
+        with mock.patch("jobs.adapters.workable.get_json", return_value=WORKABLE_PAYLOAD):
+            upsert_jobs(src, WorkableAdapter(src).fetch_jobs())
+        job = Job.objects.get()
+        self.assertEqual((job.experience_min, job.experience_max), (3, 5))
+        self.assertIn(",Noida,", job.cities)
+
+    def test_board_links(self):
+        cases = {
+            "https://jobs.ashbyhq.com/acme/a1": ("ashby", "acme", "global"),
+            "https://jobs.smartrecruiters.com/AcmeGroup/111-data": ("smartrecruiters", "AcmeGroup", "global"),
+            "https://careers.smartrecruiters.com/AcmeGroup": ("smartrecruiters", "AcmeGroup", "global"),
+            "https://apply.workable.com/acme/": ("workable", "acme", "global"),
+            "https://acme.recruitee.com/o/qa": ("recruitee", "acme", "global"),
+            "https://apply.workable.com/j/ABC123": None,
+            "https://www.recruitee.com/": None,
+        }
+        for url, expected in cases.items():
+            self.assertEqual(parse_board_url(url), expected, url)
+
+    def test_api_lists_new_adapters_and_editor_accepts_them(self):
+        U = get_user_model()
+        self.client.force_login(U.objects.create_user("adm", password="pw", is_staff=True))
+        keys = [a["key"] for a in self.client.get("/api/sources").json()["adapters"]]
+        for k in ("ashby", "smartrecruiters", "workable", "recruitee"):
+            self.assertIn(k, keys)
+        src = make_source()
+        r = self.client.patch(f"/api/sources/{src.pk}", data=json.dumps({"adapter": "ashby", "board": "acme"}), content_type="application/json")
+        self.assertEqual(r.status_code, 200)
+        src.refresh_from_db()
+        self.assertEqual((src.adapter_key, src.configuration_json), ("ashby", {"board": "acme"}))
+
+    def test_add_company_with_ashby_link(self):
+        U = get_user_model()
+        self.client.force_login(U.objects.create_user("adm", password="pw", is_staff=True))
+        with mock.patch("jobs.adapters.ashby.get_json", return_value=ASHBY_PAYLOAD):
+            r = self.client.post("/api/sources", data=json.dumps({"company_name": "Acme", "board_url": "https://jobs.ashbyhq.com/acme"}),
+                                 content_type="application/json")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual((r.json()["found"], r.json()["matching"]), (2, 1))
+        self.assertEqual(Source.objects.get(company_name="Acme").adapter_key, "ashby")
+
+
+class MorePlatformDiscoveryTests(TestCase):
+    def run_discover(self, names, responder, *extra, fetches=None):
+        import os, tempfile
+        from io import StringIO
+        from django.core.management import call_command
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("\n".join(names))
+        out = StringIO()
+        patches = [mock.patch("jobs.management.commands.discover_boards.get_json", side_effect=responder)]
+        for target, value in (fetches or {}).items():
+            patches.append(mock.patch(target, side_effect=value))
+        try:
+            for p in patches:
+                p.start()
+            call_command("discover_boards", "--names-file", fh.name, "--delay", "0", "--apply", *extra, stdout=out)
+        finally:
+            for p in patches:
+                p.stop()
+            os.unlink(fh.name)
+        return out.getvalue()
+
+    @staticmethod
+    def responder(table):
+        from jobs.adapters.http import NotFoundError
+
+        def fn(url, params=None, **kw):
+            for needle, value in table.items():
+                if needle in url:
+                    return value
+            raise NotFoundError(url)
+        return fn
+
+    def test_finds_boards_on_each_new_platform_and_verifies_names(self):
+        table = {
+            "/posting-api/job-board/acmeashby": ASHBY_PAYLOAD | {"jobs": [dict(ASHBY_PAYLOAD["jobs"][0], descriptionPlain="AcmeAshby builds. AcmeAshby rocks.")] * 2},
+            "/companies/AcmeSR/postings": {"totalFound": 2, "content": [dict(SR_LIST["content"][0], company={"name": "AcmeSR Pvt Ltd"})]},
+            "/widget/accounts/acmework": dict(WORKABLE_PAYLOAD, name="AcmeWork"),
+            "acmerec.recruitee.com": dict(RECRUITEE_PAYLOAD, offers=[dict(RECRUITEE_PAYLOAD["offers"][0], company_name="AcmeRec")]),
+            "/widget/accounts/impostor": dict(WORKABLE_PAYLOAD, name="Somebody Else"),
+        }
+        fetches = {
+            "jobs.adapters.ashby.get_json": lambda url, params=None, **kw: table["/posting-api/job-board/acmeashby"],
+            "jobs.adapters.smartrecruiters.get_json": lambda url, params=None, **kw: {"totalFound": 1, "content": SR_LIST["content"][:1]},
+            "jobs.adapters.workable.get_json": lambda url, params=None, **kw: WORKABLE_PAYLOAD,
+            "jobs.adapters.recruitee.get_json": lambda url, params=None, **kw: RECRUITEE_PAYLOAD,
+        }
+        out = self.run_discover(["AcmeAshby", "AcmeSR", "AcmeWork", "AcmeRec", "Impostor"], self.responder(table),
+                                "--platforms", "ashby,smartrecruiters,workable,recruitee", fetches=fetches)
+        got = dict(Source.objects.exclude(adapter_key="notice_board").values_list("company_name", "adapter_key"))
+        self.assertEqual(got, {"AcmeAshby": "ashby", "AcmeSR": "smartrecruiters", "AcmeWork": "workable", "AcmeRec": "recruitee"})
+        self.assertEqual(Source.objects.get(company_name="AcmeWork").careers_url, "https://apply.workable.com/acmework/")
+        self.assertIn("Impostor", out)
+        self.assertIn("NEEDS REVIEW workable:impostor", out)
+
+    def test_platforms_option_limits_probes(self):
+        seen = []
+
+        def fn(url, params=None, **kw):
+            from jobs.adapters.http import NotFoundError
+            seen.append(url)
+            raise NotFoundError(url)
+        out = self.run_discover(["Nobody"], fn, "--platforms", "ashby,workable")
+        self.assertTrue(seen and all("ashbyhq" in u or "workable" in u for u in seen), seen)
+        self.assertIn("not on Ashby/Workable", out)
+
+    def test_unknown_platform_is_rejected(self):
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError):
+            self.run_discover(["X"], lambda url, params=None, **kw: None, "--platforms", "monster")
+
+    def test_smartrecruiters_tries_camelcase_identifier(self):
+        from jobs.management.commands.discover_boards import candidates
+        self.assertIn("UrbanCompany", candidates("Urban Company", "smartrecruiters"))
+        self.assertNotIn("cult.fit", candidates("Cult.fit", "recruitee"))
+
+
+class DiscoveryRateLimitTests(TestCase):
+    def test_429_pauses_once_then_skips_platform_and_saves_names(self):
+        import os, tempfile
+        from io import StringIO
+        from django.core.management import call_command
+        from jobs.adapters.http import NotFoundError, RateLimitedError
+        calls = {"workable": 0}
+
+        def fn(url, params=None, **kw):
+            if "workable" in url:
+                calls["workable"] += 1
+                raise RateLimitedError(url)
+            raise NotFoundError(url)
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("Alpha Co\nBeta Co\nGamma Co\n")
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as base, override_settings(BASE_DIR=base), \
+             mock.patch("jobs.management.commands.discover_boards.get_json", side_effect=fn), \
+             mock.patch("jobs.management.commands.discover_boards.time.sleep") as slept:
+            call_command("discover_boards", "--names-file", fh.name, "--delay", "0", "--platforms", "ashby,workable", stdout=out)
+            saved = open(os.path.join(base, "unchecked_workable.txt")).read().split()
+        os.unlink(fh.name)
+        text = out.getvalue()
+        self.assertEqual(calls["workable"], 2)                       # first 429 -> one pause + retry -> skipped
+        self.assertIn(mock.call(60), slept.call_args_list)
+        self.assertIn("skipping it for the rest of this run", text)
+        self.assertEqual(saved, ["Alpha", "Co", "Beta", "Co", "Gamma", "Co"])
+        self.assertIn("--platforms workable --names-file unchecked_workable.txt", text)
+        self.assertIn("Workable not checked", text)
+
+    def test_single_attempt_429_raises_rate_limited(self):
+        from jobs.adapters import http
+        resp = mock.Mock(status_code=429, headers={})
+        with mock.patch.object(http, "_get_session") as sess:
+            sess.return_value.get.return_value = resp
+            with self.assertRaises(http.RateLimitedError):
+                http.get_json("https://apply.workable.com/api/v1/widget/accounts/x", attempts=1)
+        self.assertEqual(sess.return_value.get.call_count, 1)
+
+
+class WorkableNotDefaultTests(TestCase):
+    def test_default_search_skips_workable(self):
+        import os, tempfile
+        from io import StringIO
+        from django.core.management import call_command
+        from jobs.adapters.http import NotFoundError
+        seen = []
+
+        def fn(url, params=None, **kw):
+            seen.append(url)
+            raise NotFoundError(url)
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("Nobody Co\n")
+        with mock.patch("jobs.management.commands.discover_boards.get_json", side_effect=fn):
+            call_command("discover_boards", "--names-file", fh.name, "--delay", "0", stdout=StringIO())
+        os.unlink(fh.name)
+        self.assertTrue(seen)
+        self.assertFalse(any("workable" in u for u in seen))
+        self.assertTrue(any("ashbyhq" in u for u in seen))

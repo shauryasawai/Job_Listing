@@ -1,7 +1,8 @@
 # Jobline: Job Portal Aggregator
 
 Django backend + plain HTML/CSS/JS dashboard. Collects **jobs and internships located in India** from many companies
-through the **Greenhouse Job Board API** and **Lever Postings API**, stores them in a database, and runs daily or on
+through the public job-board APIs of **Greenhouse**, **Lever**, **Ashby**, **SmartRecruiters**, **Workable** and
+**Recruitee** (plus official government notice pages), stores them in a database, and runs daily or on
 demand. **AI summaries (OpenAI) are never generated automatically**: a user asks for each one, under daily caps.
 
 ## Quick start
@@ -30,6 +31,23 @@ Sign in, open **Sources**, and press **Fetch jobs now** (admins only). For the d
 >
 > Upgrading from the first version? `python manage.py migrate` (clears the old auto-generated excerpts, keeps real
 > AI summaries), then `python manage.py prune_outside_country` (dry run) / `--apply` to delete stored non-India jobs.
+
+## Keeping only companies that can be fetched
+
+`python manage.py refresh_sources` removes every source that "needs an adapter" (company career sites with no public
+feed), then checks the built-in catalogue (~270 India-hiring companies) on all six platforms and adds only boards that
+are verified to belong to the company **and** have jobs in India. `--dry-run` previews; `--platforms
+ashby,smartrecruiters,workable,recruitee` re-checks only the newer platforms (faster after a first full run). The
+**Remove N that need an adapter** button on the Sources page does the removal step from the dashboard.
+
+| Platform | Public feed used (no key needed) | Board link to paste in *Add company* |
+|---|---|---|
+| Greenhouse | `boards-api.greenhouse.io/v1/boards/NAME/jobs` | `boards.greenhouse.io/NAME` |
+| Lever | `api.lever.co/v0/postings/NAME` | `jobs.lever.co/NAME` |
+| Ashby | `api.ashbyhq.com/posting-api/job-board/NAME` | `jobs.ashbyhq.com/NAME` |
+| SmartRecruiters | `api.smartrecruiters.com/v1/companies/NAME/postings` (India only, details for the newest 100) | `jobs.smartrecruiters.com/NAME` |
+| Workable | `apply.workable.com/api/v1/widget/accounts/NAME` | `apply.workable.com/NAME` |
+| Recruitee | `NAME.recruitee.com/api/offers/` | `NAME.recruitee.com` |
 
 ## Finding companies beyond the 51
 

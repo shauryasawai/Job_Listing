@@ -20,6 +20,10 @@ class BlockedError(FetchError):
     pass
 
 
+class RateLimitedError(FetchError):
+    """The platform answered 429 (too many requests) on every attempt."""
+
+
 _session = None
 
 
@@ -34,10 +38,10 @@ def _get_session():
 MAX_PAGE_BYTES = 5 * 1024 * 1024
 
 
-def _fetch(url, params=None, accept="application/json"):
+def _fetch(url, params=None, accept="application/json", attempts=None):
     """GET with retries for transient failures (429/5xx/network). Returns the 200 response."""
-    attempts = settings.HTTP_MAX_ATTEMPTS
-    last_error = "unknown error"
+    attempts = attempts or settings.HTTP_MAX_ATTEMPTS
+    last_error, last_code = "unknown error", None
     for attempt in range(1, attempts + 1):
         try:
             resp = _get_session().get(
@@ -50,7 +54,7 @@ def _fetch(url, params=None, accept="application/json"):
             # Never disable certificate checks; report it instead.
             raise FetchError(f"The site's security certificate could not be verified: {url}")
         except requests.RequestException as exc:
-            last_error = f"network error: {exc.__class__.__name__}"
+            last_error, last_code = f"network error: {exc.__class__.__name__}", None
             log.warning("GET %s attempt %d/%d failed: %s", url, attempt, attempts, last_error)
         else:
             code = resp.status_code
@@ -64,7 +68,7 @@ def _fetch(url, params=None, accept="application/json"):
                     "disable the source or ask the owner for permission/API access."
                 )
             if code == 429 or code >= 500:
-                last_error = f"HTTP {code}"
+                last_error, last_code = f"HTTP {code}", code
                 log.warning("GET %s attempt %d/%d got %s", url, attempt, attempts, code)
                 retry_after = resp.headers.get("Retry-After", "")
                 if retry_after.isdigit() and attempt < attempts:
@@ -74,12 +78,14 @@ def _fetch(url, params=None, accept="application/json"):
                 raise FetchError(f"Unexpected HTTP {code} from {url}")
         if attempt < attempts:
             time.sleep(2 ** attempt)  # 2s, 4s
+    if last_code == 429:
+        raise RateLimitedError(f"Too many requests (HTTP 429) after {attempts} attempt(s): {url}")
     raise FetchError(f"Gave up after {attempts} attempts ({last_error}): {url}")
 
 
-def get_json(url, params=None):
-    """GET a URL and return parsed JSON."""
-    resp = _fetch(url, params)
+def get_json(url, params=None, attempts=None):
+    """GET a URL and return parsed JSON. attempts=1 turns retries off (used when probing for boards)."""
+    resp = _fetch(url, params, attempts=attempts)
     try:
         return resp.json()
     except ValueError:

@@ -342,15 +342,35 @@
     t = t.replace(/\s+on\s+(a\s+)?contract(ual)?\s+basis/i, '').replace(/\s+(at|in)\s+[A-Z][\w\s.,-]*$/, '');
     return t.trim() || j.title;
   }
+  // When a posting doesn't state a qualification, suggest one from the job title (always flagged as a suggestion).
+  const QUAL_RULES = [
+    [/\b(intern|internship|trainee|apprentice|graduate (engineer )?trainee|fresher)\b/i, 'Pursuing or recently completed graduation in a relevant field'],
+    [/\b(account executive|sales|business development|bdr|sdr|inside sales|key account|marketing|growth|brand|seo|content|customer success|account manager)\b/i, 'Graduate or MBA in Business, Marketing or a related field'],
+    [/\b(accounts?|accountant|finance|financial|audit|auditor|tax|payroll|treasury|controller|chartered|bookkeep)/i, 'Graduate or MBA in Commerce, Finance, Accounting or a related field'],
+    [/\b(engineer|engineering|developer|software|sre|devops|programmer|architect|qa|test(ing)?|automation|machine learning|ml|ai|data scientist|security|cloud|frontend|backend|full[- ]?stack|mobile|android|ios)\b/i, 'B.E./B.Tech or equivalent degree in Computer Science or a related field'],
+    [/\b(data analyst|analytics|analyst|business intelligence|bi)\b/i, 'Graduate in Statistics, Mathematics, Economics, Engineering or a related field'],
+    [/\b(hr|human resources?|recruit(er|ment)?|talent|people (partner|operations)|hrbp)\b/i, 'Graduate or MBA in Human Resources or a related field'],
+    [/\b(design(er)?|ux|ui|graphic|creative|illustrat)/i, 'Degree or diploma in Design or a related field'],
+    [/\b(legal|counsel|lawyer|advocate|compliance)\b/i, 'Degree in Law (LLB/LLM) or a related field'],
+    [/\b(product manager|program manager|project manager|operations manager|strategy|consultant)\b/i, 'Graduate in a relevant field; MBA preferred'],
+  ];
+  function suggestQualification(title) {
+    const rule = QUAL_RULES.find(([re]) => re.test(title || ''));
+    return rule ? rule[1] : 'Graduate in a relevant field';
+  }
+  const NOTICE_QUAL = 'As per the official notice';
+  const suggestedQualFor = (j) => (j.is_notice ? NOTICE_QUAL : suggestQualification(j.title));
+  const qualificationFor = (j) => j.qualification || suggestedQualFor(j);
+
   // The standard LinkedIn/WhatsApp format: one block per role, blocks separated by blank lines.
   function postBlock(j, o, edits) {
     const e = edits || {};
     const lines = [
-      `Looking For ${(e.title ?? postRole(j)).trim()}${typeSuffix(j)} For ${(o.company || '').trim() || j.company}`,
+      `Looking For ${e.title != null ? e.title.trim() : postRole(j) + typeSuffix(j)} For ${(o.company || '').trim() || j.company}`,
       '',
       `Experience - ${(e.exp ?? j.experience) || 'Not specified'}`,
       `Location - ${(e.loc ?? postLocation(j)) || 'Not specified'}`,
-      `Qualification - ${(e.qual ?? j.qualification) || 'Not specified'}`,
+      `Qualification - ${(e.qual != null ? e.qual.trim() : '') || qualificationFor(j)}`,
     ];
     const tail = [];
     if ((o.email || '').trim()) tail.push(`Please share resumes to ${o.email.trim()}`);
@@ -359,45 +379,367 @@
     return lines.join('\n');
   }
 
+  /* ---------- image post: Early Careers Board template ---------- */
+  // Pulls up to `max` bullet points from the section of a posting that matches `kind`
+  // ("req" = requirements/qualifications, "resp" = responsibilities). Empty when the posting has no such section.
+  const SECTION_HEADS = {
+    req: /^(requirements?|key requirements|job requirements|qualifications?|minimum qualifications|basic qualifications|required qualifications|preferred qualifications|skills( required| and experience)?|what you('|’)ll (need|bring)|what you need|what we('|’)re looking for|what we look for|who you are|you have|about you|must[- ]haves?|eligibility( criteria)?|desired (skills|profile)|candidate profile)\b/i,
+    resp: /^(responsibilities|key responsibilities|roles? (and|&) responsibilities|job responsibilities|what you('|’)ll do|what you will do|what you('|’)ll be doing|your role|the role|in this role|duties|key duties|day[- ]to[- ]day|your impact|what you('|’)ll own|job description)\b/i,
+  };
+  function looksLikeHeading(line) {
+    const t = line.replace(/^[#\s]+/, '');
+    return !/^[•\-*–·\d]/.test(line) && t.length < 70 && !/[.;,]$/.test(t) && (/:$/.test(t) || t.split(/\s+/).length <= 6);
+  }
+  function shorten(t, max) {
+    if (t.length <= max) return t;
+    const cut = t.slice(0, max); const sp = cut.lastIndexOf(' ');
+    return (sp > max * 0.6 ? cut.slice(0, sp) : cut).replace(/[,;:\s]+$/, '') + '…';
+  }
+  function extractBullets(desc, kind, max = 4) {
+    const lines = (desc || '').split('\n').map((l) => l.trim()).filter(Boolean);
+    const start = lines.findIndex((l) => l.length < 80 && SECTION_HEADS[kind].test(l.replace(/^[#•\-*\s]+/, '')));
+    if (start < 0) return [];
+    const out = [];
+    for (let k = start + 1; k < lines.length && out.length < max; k++) {
+      const l = lines[k];
+      if (looksLikeHeading(l)) { if (out.length) break; continue; }
+      const t = l.replace(/^[•\-*–·]+\s*|^\d+[.)]\s+/, '').trim();
+      if (t.length >= 12) out.push(shorten(t, 190));
+    }
+    return out;
+  }
+
+  // When a posting has no labelled section, take sentences from its description so the image is still descriptive.
+  const BOILERPLATE = /(equal opportunity|equal employment|discriminat|benefits?|perks|insurance|privacy|cookie|apply (now|here|today)|click|about (us|the company)|we are (an?|the)|our (mission|values|culture|company)|founded in|headquartered|salary|ctc|compensation)/i;
+  const REQ_HINT = /\b(experience|years?|skills?|knowledge|proficien|familiar|understanding|ability|strong|hands[- ]on|expertise|degree|graduate|certif)/i;
+  function descriptionSentences(desc) {
+    const out = [];
+    for (const raw of (desc || '').split('\n')) {
+      const line = raw.trim().replace(/^[•\-*–·]+\s*|^\d+[.)]\s+/, '');
+      if (!line || looksLikeHeading(raw.trim()) || /^(experience|qualification|location|last date|official notice)\b/i.test(line) || BOILERPLATE.test(line)) continue;
+      for (const sentence of line.split(/(?<=[.!?])\s+/)) {
+        const t = sentence.trim();
+        if (t.length >= 30 && t.length <= 240) out.push(t);
+      }
+    }
+    return [...new Set(out)];
+  }
+  function fallbackBullets(desc, kind, experience, max = 4) {
+    const sentences = descriptionSentences(desc);
+    if (kind === 'req') {
+      const out = experience ? [`${experience} of relevant experience`] : [];
+      for (const t of sentences) if (out.length < max && REQ_HINT.test(t)) out.push(shorten(t, 190));
+      return out;
+    }
+    return sentences.filter((t) => !REQ_HINT.test(t) || /\b(you will|you'll|responsible|own|manage|lead|build|develop|create|work with|support|drive)\b/i.test(t))
+      .slice(0, max).map((t) => shorten(t, 190));
+  }
+
+  const POST = { w: 1600, h: 899, purple: '#5A2982', ink: '#1F2430', left: 133, right: 1205, bottom: 834, footerTop: 845,
+    rows: [['pos', 251, 186], ['qual', 307, 233], ['loc', 257, 283], ['exp', 289, 328]],
+    font: 'Lato, "Segoe UI", Arial, sans-serif' };
+  let templateImg = null;
+  function loadTemplate() {
+    if (templateImg) return templateImg;
+    templateImg = new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => { templateImg = null; reject(new Error('The post template image could not be loaded.')); };
+      img.src = $('#post-dialog').dataset.template;
+    });
+    return templateImg;
+  }
+  async function fontsReady() {
+    if (!document.fonts || !document.fonts.load) return;
+    try { await Promise.race([Promise.all(['400 28px Lato', '700 28px Lato'].map((f) => document.fonts.load(f))), new Promise((r) => setTimeout(r, 1500))]); }
+    catch (_) { /* fall back to system fonts */ }
+  }
+  const font = (size, weight = 400) => `${weight} ${size}px ${POST.font}`;
+  function wrapText(ctx, text, width) {
+    const words = text.split(/\s+/).filter(Boolean), lines = [];
+    let line = '';
+    for (const w of words) {
+      const test = line ? line + ' ' + w : w;
+      if (ctx.measureText(test).width <= width || !line) line = test; else { lines.push(line); line = w; }
+    }
+    if (line) lines.push(line);
+    return lines;
+  }
+  // Largest size (down to `min`) at which `text` fits on one line; ellipsis if it still doesn't.
+  function fitLine(ctx, text, width, size, min, weight = 400) {
+    for (let s = size; s >= min; s--) { ctx.font = font(s, weight); if (ctx.measureText(text).width <= width) return [text, s]; }
+    ctx.font = font(min, weight);
+    let t = text;
+    while (t.length > 1 && ctx.measureText(t + '…').width > width) t = t.slice(0, -1);
+    return [t.trimEnd() + '…', min];
+  }
+
+  async function drawPostImage(canvas, d) {
+    const [tpl] = await Promise.all([loadTemplate(), fontsReady()]);
+    const ctx = canvas.getContext('2d');
+    canvas.width = POST.w; canvas.height = POST.h;
+    ctx.drawImage(tpl, 0, 0, POST.w, POST.h);
+    ctx.textBaseline = 'alphabetic';
+    const warnings = [];
+
+    // Right column: shrink the illustration into the top-right corner to make room for text and the QR code.
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(1000, 140, 600, POST.footerTop - 140);
+    ctx.drawImage(tpl, 1036, 155, 540, 442, 1232, 128, 300, 246);
+
+    // Position / Qualification / Location / Experience values, next to the labels printed on the template.
+    const values = { pos: d.position, qual: d.qualification, loc: d.location, exp: d.experience };
+    ctx.fillStyle = POST.ink;
+    for (const [key, x, baseline] of POST.rows) {
+      const v = (values[key] || '').trim() || 'Not specified';
+      const [t, size] = fitLine(ctx, v, POST.right - x, 30, 20);
+      if (t !== v) warnings.push(`${{ pos: 'Position', qual: 'Qualification', loc: 'Location', exp: 'Experience' }[key]} was too long and has been shortened.`);
+      ctx.font = font(size); ctx.fillText(t, x, baseline);
+    }
+
+    // Requirements and Responsibilities: flowed below, shrinking the text until both sections fit above the footer.
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(124, 346, POST.right + 20 - 124, POST.footerTop - 346);
+    const top = 352, room = POST.bottom - top, textX = POST.left + 24, textW = POST.right - textX;
+    let sections = [['REQUIREMENTS', d.requirements], ['RESPONSIBILITIES', d.responsibilities]]
+      .map(([h, items]) => [h, items.map((x) => x.trim()).filter(Boolean)]).filter(([, items]) => items.length);
+    const measure = (size) => {
+      const m = { size, head: Math.round(size * 1.25), lineH: Math.round(size * 1.24), gapItem: Math.round(size * 0.3), gapHead: Math.round(size * 0.5), gapSection: Math.round(size * 0.85) };
+      ctx.font = font(size);
+      m.blocks = sections.map(([hdr, items]) => [hdr, items.map((it) => wrapText(ctx, it, textW))]);
+      m.height = m.blocks.reduce((acc, [, items], i) => acc + (i ? m.gapSection : 0) + m.head + m.gapHead
+        + items.reduce((a2, lines, k) => a2 + lines.length * m.lineH + (k ? m.gapItem : 0), 0), 0);
+      return m;
+    };
+    let m = null;
+    for (;;) {
+      for (let size = 28; size >= 19; size--) { m = measure(size); if (m.height <= room) break; }
+      if (m.height <= room || !sections.length) break;
+      // Still too long at the smallest size: drop the last bullet of the longer section.
+      const longest = sections.reduce((a, b) => (b[1].length >= a[1].length ? b : a));
+      longest[1] = longest[1].slice(0, -1);
+      warnings.push('Some bullet points didn’t fit and were left out. Shorten them to include more.');
+      sections = sections.filter(([, items]) => items.length);
+    }
+    if (m && sections.length) {
+      let y = top;
+      m.blocks.forEach(([hdr, items], i) => {
+        if (i) y += m.gapSection;
+        y += m.head; ctx.font = font(m.head, 700); ctx.fillStyle = POST.purple; ctx.fillText(hdr, POST.left, y);
+        y += m.gapHead;
+        ctx.font = font(m.size); ctx.fillStyle = POST.ink;
+        items.forEach((lines, k) => {
+          if (k) y += m.gapItem;
+          lines.forEach((ln, li) => {
+            y += m.lineH;
+            if (li === 0) { ctx.beginPath(); ctx.arc(POST.left + 8, y - m.size * 0.33, Math.max(3, m.size * 0.14), 0, Math.PI * 2); ctx.fill(); }
+            ctx.fillText(ln, textX, y);
+          });
+        });
+      });
+    }
+
+    // Bottom-right: QR code with "Scan the QR or visit … to apply", or where to send resumes.
+    const cx = 1385;
+    ctx.textAlign = 'center';
+    if (d.qr && d.qrUrl) {
+      const shown = d.qrUrl.replace(/^https?:\/\//i, '').replace(/\/$/, '');
+      ctx.fillStyle = POST.ink; ctx.font = font(28, 700); ctx.fillText('Scan the QR or visit', cx, 452);
+      const [u, us] = fitLine(ctx, shown, 360, 28, 16, 400);
+      ctx.fillStyle = POST.purple; ctx.font = font(us); ctx.fillText(u, cx, 486);
+      ctx.fillStyle = POST.ink; ctx.font = font(28, 700); ctx.fillText('to apply', cx, 520);
+      try {
+        const qr = qrcode(0, 'M'); qr.addData(d.qrUrl); qr.make();
+        const n = qr.getModuleCount(), size = 250, cell = Math.floor(size / n), real = cell * n;
+        const qx = Math.round(cx - real / 2), qy = 545 + Math.round((size - real) / 2);
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(qx - 10, qy - 10, real + 20, real + 20);
+        ctx.fillStyle = '#000000';
+        for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) ctx.fillRect(qx + c * cell, qy + r * cell, cell, cell);
+      } catch (e) { warnings.push('That address is too long for a QR code.'); }
+    } else if ((d.email || '').trim()) {
+      ctx.fillStyle = POST.ink; ctx.font = font(28, 700); ctx.fillText('Share your resume at', cx, 560);
+      const [em, es] = fitLine(ctx, d.email.trim(), 360, 30, 16, 700);
+      ctx.fillStyle = POST.purple; ctx.font = font(es, 700); ctx.fillText(em, cx, 600);
+    }
+    ctx.textAlign = 'start';
+    return warnings;
+  }
+
   function openComposer(jobs) {
     if (!jobs.length) return;
     const dlg = $('#post-dialog'), single = jobs.length === 1, j0 = jobs[0];
     const text = $('#post-text'), company = $('#post-company'), email = $('#post-email'), link = $('#post-link');
+    const req = $('#post-req'), resp = $('#post-resp'), qr = $('#post-qr'), qrUrl = $('#post-qr-url'), canvas = $('#post-canvas');
+    const qual = $('#post-qual');
     $('#post-title').textContent = single ? 'Create post' : `Create post for ${jobs.length} roles`;
     company.value = store.get('jobline.companyLine');
     email.value = store.get('jobline.resumeEmail') || state.me.email || '';
     link.checked = store.get('jobline.addLink') === '1';
+    qr.checked = store.get('jobline.postQr') !== '0';
+    qrUrl.value = store.get('jobline.postQrUrl') || 'https://career.marketscope.in/jobs';
     $('#post-single-fields').hidden = !single;
+    req.value = ''; resp.value = '';
+    let suggestedQual = '';   // non-empty while the qualification shown is our suggestion, not from the posting
     if (single) {
-      $('#post-role').value = postRole(j0); $('#post-exp').value = j0.experience || '';
-      $('#post-loc').value = postLocation(j0); $('#post-qual').value = j0.qualification || '';
+      $('#post-role').value = postRole(j0) + typeSuffix(j0); $('#post-exp').value = j0.experience || '';
+      $('#post-loc').value = postLocation(j0);
+      suggestedQual = j0.qualification ? '' : suggestedQualFor(j0);
+      qual.value = j0.qualification || suggestedQual;
     }
-    const missing = () => {
-      const m = new Set();
-      jobs.forEach((j) => {
-        if (single ? !$('#post-exp').value.trim() : !j.experience) m.add('experience');
-        if (single ? !$('#post-qual').value.trim() : !j.qualification) m.add('qualification');
-      });
-      return [...m];
+    const qualIsSuggestion = () => single && suggestedQual && qual.value.trim() === suggestedQual;
+    const suggestedRoles = () => (single ? (qualIsSuggestion() && !j0.is_notice ? [j0] : []) : jobs.filter((j) => !j.qualification && !j.is_notice));
+    const qualNote = () => {
+      const list = suggestedRoles();
+      if (!list.length) return '';
+      return single
+        ? `The posting doesn’t state a qualification, so “${suggestedQual}” is suggested from the job title. Check it before sharing.`
+        : `${list.length} posting${list.length > 1 ? 's don’t' : ' doesn’t'} state a qualification, so one is suggested from the job title (${list.map((j) => j.title).slice(0, 3).join('; ')}${list.length > 3 ? '…' : ''}). Check before sharing.`;
     };
+
+    // ---- tabs (image posts are one role at a time)
+    const tabText = $('#tab-text'), tabImage = $('#tab-image');
+    tabImage.disabled = !single;
+    tabImage.title = single ? '' : 'Image posts are made one role at a time. Select a single role to make one.';
+    let mode = 'text';
+    const setMode = (m) => {
+      mode = m;
+      tabText.setAttribute('aria-selected', String(m === 'text')); tabImage.setAttribute('aria-selected', String(m === 'image'));
+      tabText.tabIndex = m === 'text' ? 0 : -1; tabImage.tabIndex = m === 'image' ? 0 : -1;
+      $('#post-text-pane').hidden = m !== 'text'; $('#post-text-actions').hidden = m !== 'text';
+      $('#post-image-pane').hidden = m !== 'image'; $('#post-image-actions').hidden = m !== 'image';
+      $('#post-image-fields').hidden = m !== 'image';
+      $('#post-link-row').hidden = m !== 'text';
+      $('#post-company').closest('label').hidden = m !== 'text';
+      $('#post-both-actions').hidden = !single;
+      $('#post-linkedin').hidden = single;
+      redraw();
+    };
+    tabText.onclick = () => setMode('text');
+    tabImage.onclick = () => { if (!tabImage.disabled) setMode('image'); };
+    $('.tabs').onkeydown = (e) => {
+      if (!['ArrowLeft', 'ArrowRight'].includes(e.key) || !single) return;
+      const next = mode === 'text' ? 'image' : 'text'; setMode(next); (next === 'text' ? tabText : tabImage).focus();
+    };
+
+    // ---- requirements / responsibilities from the full posting (loaded as soon as the dialog opens)
+    const note = $('#post-extract-note');
+    let detailsReady = Promise.resolve();
+    async function loadDetails() {
+      note.hidden = false; note.textContent = 'Reading the posting for requirements and responsibilities…';
+      try {
+        const full = await api(`/api/jobs/${j0.id}`);
+        let r = extractBullets(full.description, 'req'), p = extractBullets(full.description, 'resp');
+        const derived = [];
+        if (!r.length) { r = fallbackBullets(full.description, 'req', $('#post-exp').value.trim()); if (r.length) derived.push('requirements'); }
+        if (!p.length) { p = fallbackBullets(full.description, 'resp'); if (p.length) derived.push('responsibilities'); }
+        if (!req.value.trim()) req.value = r.join('\n');
+        if (!resp.value.trim()) resp.value = p.join('\n');
+        const empty = [!r.length && 'requirements', !p.length && 'responsibilities'].filter(Boolean);
+        note.textContent = [
+          derived.length ? `The posting has no labelled ${derived.join(' or ')} section, so these points were taken from its description. Check them.` : '',
+          empty.length ? `Nothing suitable was found for ${empty.join(' or ')}: type ${empty.length > 1 ? 'them' : 'it'} above (left out of the image if empty).` : '',
+          !derived.length && !empty.length ? 'Filled from the posting. Edit freely: up to 4 short points each fit well.' : '',
+        ].filter(Boolean).join(' ');
+      } catch (e) { note.textContent = `Couldn’t read the posting (${e.message}). Type the points above.`; }
+      redraw();
+    }
+
+    // ---- image drawing: kept up to date for single roles so "Share text + image" is instant
+    let timer = null, latestBlob = null, latestKey = '';
+    const imageData = () => ({
+      position: $('#post-role').value, qualification: qual.value.trim() || suggestQualification($('#post-role').value),
+      location: $('#post-loc').value, experience: $('#post-exp').value,
+      requirements: req.value.split('\n'), responsibilities: resp.value.split('\n'),
+      qr: qr.checked, qrUrl: qrUrl.value.trim(), email: email.value,
+    });
+    const showImageWarnings = (warnings) => {
+      const all = [...new Set([qualNote(), ...warnings].filter(Boolean))];
+      const w = $('#post-image-warn'); w.hidden = !all.length; w.textContent = all.join(' ');
+    };
+    async function render() {
+      const data = imageData(), key = JSON.stringify(data);
+      if (latestBlob && key === latestKey) return latestBlob;
+      const warnings = await drawPostImage(canvas, data);
+      showImageWarnings(warnings);
+      latestBlob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+      latestKey = key;
+      return latestBlob;
+    }
+    function redraw() {
+      if (!single) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => { render().catch((e) => showImageWarnings([e.message])); }, 150);
+    }
+    const imageBlob = async () => { clearTimeout(timer); await detailsReady; return render(); };
+    const fileName = () => `${($('#post-role').value || j0.title).replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '').slice(0, 60) || 'job'}-post.png`;
+    const downloadBlob = (blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = h('a', { href: url, download: fileName() }); document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    };
+    $('#post-download').onclick = async () => {
+      try { downloadBlob(await imageBlob()); toast('Image downloaded. Attach it to your LinkedIn post.'); }
+      catch (e) { toast(e.message || 'The image could not be created.', true); }
+    };
+    $('#post-copy-image').onclick = async () => {
+      try {
+        const blob = await imageBlob();
+        if (!window.ClipboardItem || !navigator.clipboard || !navigator.clipboard.write) throw new Error('This browser can’t copy images. Use Download PNG instead.');
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        toast('Image copied. Paste it into your LinkedIn post with Ctrl+V.');
+      } catch (e) { toast(e.message || 'Couldn’t copy the image. Use Download PNG instead.', true); }
+    };
+
+    // ---- text + image together
+    async function linkedInBoth() {
+      try {
+        const blob = await imageBlob();
+        await copyText(text.value, 'Post text copied.');
+        downloadBlob(blob);
+        toast('Text copied and image downloaded. In LinkedIn: Start a post, paste the text (Ctrl+V), then add the image with the photo icon.');
+        window.open('https://www.linkedin.com/feed/', '_blank', 'noopener');
+      } catch (e) { toast(e.message || 'The image could not be created.', true); }
+    }
+    $('#post-linkedin-both').onclick = linkedInBoth;
+    $('#post-share-both').onclick = async () => {
+      let blob;
+      try { blob = latestBlob && latestKey === JSON.stringify(imageData()) ? latestBlob : await imageBlob(); }
+      catch (e) { toast(e.message || 'The image could not be created.', true); return; }
+      const shareData = { text: text.value, files: [new File([blob], fileName(), { type: 'image/png' })] };
+      if (navigator.canShare && navigator.canShare(shareData)) {
+        try { await navigator.share(shareData); return; }
+        catch (e) { if (e.name === 'AbortError') return; }
+      }
+      toast('This browser can’t share text and image together, so the LinkedIn route is used instead.');
+      linkedInBoth();
+    };
+
+    // ---- text post
+    const missingExperience = () => jobs.some((j) => (single ? !$('#post-exp').value.trim() : !j.experience));
     const syncWa = () => { $('#post-wa').href = 'https://wa.me/?text=' + encodeURIComponent(text.value); };
     const build = () => {
       const o = { company: company.value, email: email.value, link: link.checked };
-      const edits = single ? { title: $('#post-role').value, exp: $('#post-exp').value, loc: $('#post-loc').value, qual: $('#post-qual').value } : null;
+      const edits = single ? { title: $('#post-role').value, exp: $('#post-exp').value, loc: $('#post-loc').value, qual: qual.value } : null;
       text.value = jobs.map((j) => postBlock(j, o, edits)).join('\n\n\n');
-      const m = missing(), warn = $('#post-warn');
-      warn.hidden = !m.length;
-      warn.textContent = m.length ? `${single ? 'The posting' : 'Some postings'} didn’t state ${m.join(' or ')}, so the post says “Not specified”. ${single ? 'Fill it in above' : 'Edit it in the text'} before sharing.` : '';
+      const warn = $('#post-warn');
+      const msgs = [
+        missingExperience() ? `${single ? 'The posting doesn’t' : 'Some postings don’t'} state experience, so the post says “Not specified”. ${single ? 'Fill it in above' : 'Edit it in the text'} before sharing.` : '',
+        qualNote(),
+      ].filter(Boolean);
+      warn.hidden = !msgs.length; warn.textContent = msgs.join(' ');
       $('#post-email-hint').hidden = !email.value.trim() || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.value.trim());
+      $('#post-qr-url-row').hidden = !qr.checked;
       syncWa();
       store.set('jobline.companyLine', company.value); store.set('jobline.resumeEmail', email.value); store.set('jobline.addLink', link.checked ? '1' : '0');
+      store.set('jobline.postQr', qr.checked ? '1' : '0'); store.set('jobline.postQrUrl', qrUrl.value.trim());
+      redraw();
     };
-    dlg.querySelectorAll('input').forEach((el) => { el.oninput = build; el.onchange = build; });
+    dlg.querySelectorAll('input, #post-req, #post-resp').forEach((el) => { el.oninput = build; el.onchange = build; });
     text.oninput = syncWa;
     $('#post-copy').onclick = () => copyText(text.value, 'Post copied. Paste it into LinkedIn or WhatsApp.');
     $('#post-linkedin').onclick = async () => { await copyText(text.value, 'Post copied. Paste it into the LinkedIn post box.'); window.open('https://www.linkedin.com/feed/', '_blank', 'noopener'); };
     $('#post-close').onclick = () => dlg.close();
+    setMode('text');
     build();
+    if (single) detailsReady = loadDetails(); else note.hidden = true;
     dlg.showModal();
   }
 
@@ -747,6 +1089,7 @@
     const filter = h('select', { id: 'src-filter', 'aria-label': 'Which sources to show', onchange: (e) => { state.sourceFilter = e.target.value; viewSources({ quiet: true }); } },
       [['all', 'All sources'], ['collecting', 'Collecting'], ['failing', 'Failing'], ['adapter', 'Needs an adapter'], ['paused', 'Paused']].map(([v, t]) => h('option', { value: v, selected: state.sourceFilter === v }, t)));
     const shown = state.sources.filter(match);
+    const unsupportedCount = state.sources.filter((s) => s.adapter === 'unsupported').length;
     const onCount = shown.filter((s) => s.active).length;
     const allSwitch = h('input', { type: 'checkbox', checked: shown.length > 0 && onCount === shown.length, disabled: !shown.length,
       'aria-label': `Collect from all ${shown.length} sources shown`,
@@ -760,7 +1103,7 @@
       return h('tr', { 'data-source-row': String(s.id) },
         h('td', null, h('a', { href: safeHref(s.careers_url) || '#', target: '_blank', rel: 'noopener noreferrer' }, s.company),
           s.sector === 'government' && h('span', { class: 'cell-sub' }, 'Government')),
-        h('td', null, s.adapter === 'unsupported' ? 'None' : (s.adapter === 'notice_board' ? 'Government notice page' : label(s.adapter)),
+        h('td', null, s.adapter === 'unsupported' ? 'None' : (s.adapter === 'notice_board' ? 'Government notice page' : adapterName(s.adapter)),
           admin && s.board && h('span', { class: 'cell-sub' }, s.board + (s.region === 'eu' ? ' (EU)' : '')),
           admin && s.notice_url && h('span', { class: 'cell-sub' }, (() => { try { return new URL(s.notice_url).host; } catch (_) { return s.notice_url; } })())),
         h('td', { class: 'num' }, s.job_count == null ? '' : num(s.job_count)),
@@ -780,6 +1123,8 @@
         h('div', null, h('h1', null, 'Sources'),
           h('p', { class: 'lead' }, 'Company job boards and official government pages that Jobline collects from.')),
         h('div', { class: 'page-actions' },
+          admin && unsupportedCount > 0 && h('button', { class: 'btn', type: 'button', onclick: removeUnsupported },
+            `Remove ${num(unsupportedCount)} that need an adapter`),
           admin && h('button', { class: 'btn primary', type: 'button', onclick: addCompany }, icon('plus'), 'Add source'))),
       h('section', { class: 'panel health', 'aria-label': 'Source health' },
         h('div', { class: 'health-stats', id: 'health-stats' }),
@@ -800,6 +1145,37 @@
     state.refreshView = viewSources;
   }
 
+  // Small confirm dialog: resolves true when the person confirms.
+  function ask({ title, text, detail, ok }) {
+    const dlg = $('#ask-dialog');
+    $('#ask-title').textContent = title; $('#ask-text').textContent = text;
+    $('#ask-detail').textContent = detail || ''; $('#ask-detail').hidden = !detail;
+    $('#ask-ok').textContent = ok;
+    return new Promise((resolve) => {
+      const done = (v) => { dlg.close(); resolve(v); };
+      $('#ask-ok').onclick = () => done(true);
+      $('#ask-cancel').onclick = () => done(false);
+      dlg.oncancel = () => resolve(false);
+      dlg.showModal(); $('#ask-cancel').focus();
+    });
+  }
+  async function removeUnsupported() {
+    const list = state.sources.filter((s) => s.adapter === 'unsupported');
+    const yes = await ask({
+      title: `Remove ${list.length} sources?`,
+      text: 'These companies post jobs only on their own career sites, which Jobline can’t read, so they never collect anything. They’ll be removed from the list. You can add companies with a Greenhouse, Lever, Ashby, SmartRecruiters, Workable or Recruitee job board any time.',
+      detail: list.map((s) => s.company).join(', '),
+      ok: `Remove ${list.length} sources`,
+    });
+    if (!yes) return;
+    try {
+      const r = await api('/api/sources/remove-unsupported', { method: 'POST', body: { confirm: true } });
+      toast(`Removed ${num(r.removed)} sources that needed an adapter.`);
+      state.sourceFilter = 'all';
+    } catch (e) { toast(e.message, true); }
+    await refreshStatus();
+    viewSources({});
+  }
   async function setAllActive(list, active) {
     const where = state.sourceFilter === 'all' ? '' : ' shown';
     try {
@@ -849,6 +1225,18 @@
   }
 
   /* ------------------------------------------------------------ source editor */
+  const BOARD_LABELS = {
+    greenhouse: 'Greenhouse board token (boards.greenhouse.io/TOKEN)',
+    lever: 'Lever site name (jobs.lever.co/NAME)',
+    ashby: 'Ashby job board name (jobs.ashbyhq.com/NAME)',
+    smartrecruiters: 'SmartRecruiters company identifier (jobs.smartrecruiters.com/NAME)',
+    workable: 'Workable account name (apply.workable.com/NAME)',
+    recruitee: 'Recruitee company name (NAME.recruitee.com)',
+  };
+  function adapterName(key) {
+    const a = state.adapters.find((x) => x.key === key);
+    return a ? a.label : label(key);
+  }
   function editSource(s) {
     const dlg = $('#source-dialog');
     const adapter = $('#src-adapter'), board = $('#src-board'), region = $('#src-region'), testBox = $('#src-test');
@@ -863,7 +1251,7 @@
       $('#src-board-field').hidden = none || notice;
       $('#src-notice-fields').hidden = !notice;
       $('#src-region-field').hidden = adapter.value !== 'lever';
-      $('#src-board-label').textContent = adapter.value === 'lever' ? 'Lever site name (jobs.lever.co/NAME)' : 'Greenhouse board token (boards.greenhouse.io/TOKEN)';
+      $('#src-board-label').textContent = BOARD_LABELS[adapter.value] || 'Board name';
       $('#src-test-btn').disabled = none;
     };
     adapter.onchange = sync; sync();

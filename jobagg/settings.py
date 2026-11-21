@@ -170,8 +170,6 @@ OPENAI_API_KEY_SOURCE = (
 )
 OPENAI_MODEL = env("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_BASE_URL = env("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-OPENAI_PRICE_IN_PER_1M = float(env("OPENAI_PRICE_IN_PER_1M", "0") or 0)
-OPENAI_PRICE_OUT_PER_1M = float(env("OPENAI_PRICE_OUT_PER_1M", "0") or 0)
 SUMMARY_MAX_INPUT_CHARS = int(env("SUMMARY_MAX_INPUT_CHARS", "12000"))
 # AI summaries are NEVER generated automatically; a user asks for each one.
 # Daily caps (reset at local midnight, TIME_ZONE). 0 = no summaries allowed.
@@ -195,6 +193,10 @@ MISSING_CHECKS_BEFORE_CLOSED = int(env("MISSING_CHECKS_BEFORE_CLOSED", "3"))
 GREENHOUSE_API_BASE = env("GREENHOUSE_API_BASE", "https://boards-api.greenhouse.io").rstrip("/")
 LEVER_API_BASE = env("LEVER_API_BASE", "https://api.lever.co").rstrip("/")
 LEVER_API_BASE_EU = env("LEVER_API_BASE_EU", "https://api.eu.lever.co").rstrip("/")
+ASHBY_API_BASE = env("ASHBY_API_BASE", "https://api.ashbyhq.com").rstrip("/")
+SMARTRECRUITERS_API_BASE = env("SMARTRECRUITERS_API_BASE", "https://api.smartrecruiters.com").rstrip("/")
+WORKABLE_API_BASE = env("WORKABLE_API_BASE", "https://apply.workable.com").rstrip("/")
+RECRUITEE_API_BASE = env("RECRUITEE_API_BASE", "https://{company}.recruitee.com").rstrip("/")
 
 HTTP_CONNECT_TIMEOUT = 10
 HTTP_READ_TIMEOUT = 45

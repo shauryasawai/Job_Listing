@@ -22,7 +22,7 @@ from .adapters.http import FetchError
 from .geo import matches_country_filter
 from .extract import experience_label
 from .geo import REMOTE
-from .models import FetchRun, Job, RoleSummary, Source, SourceRunResult, SummaryLog
+from .models import FetchRun, Job, RoleSummary, Source, SummaryLog
 from .quota import quota_for
 from .runner import RunInProgress, cancel_run, create_run, release_stale_runs, start_in_thread
 from . import summarizer
@@ -378,7 +378,7 @@ NO_NOTICES_HINT = ("No recruitment notices were found on that page. Use the page
 
 
 def _source_create(request):
-    """Add a company (Greenhouse/Lever board link) or a government notice page. It is test-fetched first."""
+    """Add a company (job board link on a supported platform) or a government notice page. It is test-fetched first."""
     data = body_json(request)
     if data is None:
         return JsonResponse({"error": "Invalid JSON body."}, status=400)
@@ -401,7 +401,10 @@ def _source_create(request):
         link = str(data.get("board_url", "")).strip()
         parsed = parse_board_url(link)
         if not parsed:
-            return JsonResponse({"error": "Paste a Greenhouse link (boards.greenhouse.io/NAME) or a Lever link (jobs.lever.co/NAME)."}, status=400)
+            return JsonResponse({"error": "Paste the company's job board link from Greenhouse (boards.greenhouse.io/NAME), "
+                                          "Lever (jobs.lever.co/NAME), Ashby (jobs.ashbyhq.com/NAME), SmartRecruiters "
+                                          "(jobs.smartrecruiters.com/NAME), Workable (apply.workable.com/NAME) or "
+                                          "Recruitee (NAME.recruitee.com)."}, status=400)
         adapter_key, board, region = parsed
         if Source.objects.filter(adapter_key=adapter_key, configuration_json__board=board).exists():
             return JsonResponse({"error": "That job board is already added under another name."}, status=409)
@@ -420,6 +423,18 @@ def _source_create(request):
     payload.update(found=len(jobs), matching=kept, kept=min(kept, cap) if cap > 0 else kept,
                    sample=[j.title for j in jobs[:3]])
     return JsonResponse(payload, status=201)
+
+
+@require_POST
+@admin_api
+def sources_remove_unsupported(request):
+    """Delete every source that needs an adapter (company sites this app can't read), with any jobs they hold."""
+    if (body_json(request) or {}).get("confirm") is not True:
+        return JsonResponse({"error": "Send confirm: true to remove these sources."}, status=400)
+    qs = Source.objects.filter(adapter_key=Source.ADAPTER_NONE)
+    names = list(qs.order_by("company_name").values_list("company_name", flat=True))
+    deleted = qs.delete()[1]
+    return JsonResponse({"removed": deleted.get("jobs.Source", 0), "jobs_removed": deleted.get("jobs.Job", 0), "names": names})
 
 
 @require_POST
